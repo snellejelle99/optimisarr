@@ -109,6 +109,9 @@ internal static class LibraryEndpoints
                 Priority = parsed.Priority,
                 MinFileSizeBytes = parsed.MinFileSizeBytes,
                 MaxHeight = parsed.MaxHeight,
+                VideoDownscaleHeight = parsed.VideoDownscaleHeight,
+                MaxFrameRate = parsed.MaxFrameRate,
+                CropBlackBars = parsed.CropBlackBars,
                 ReencodeSameCodecAboveBytes = parsed.ReencodeSameCodecAboveBytes,
                 SkipEfficientSources = parsed.SkipEfficientSources,
                 TargetVideoCodec = parsed.TargetVideoCodec,
@@ -116,6 +119,12 @@ internal static class LibraryEndpoints
                 HdrHandling = parsed.HdrHandling,
                 OptimiseDolbyVision = parsed.OptimiseDolbyVision,
                 ExcludePaths = parsed.ExcludePaths,
+                ExcludeHardLinkedFiles = parsed.ExcludeHardLinkedFiles,
+                SkipSourceCodecs = parsed.SkipSourceCodecs,
+                ContentTune = parsed.ContentTune,
+                MaxBitrateKbps = parsed.MaxBitrateKbps,
+                MinBitrateKbps = parsed.MinBitrateKbps,
+                StrongerAdaptiveQuantisation = parsed.StrongerAdaptiveQuantisation,
                 QualityCrf = parsed.QualityCrf,
                 EncoderPreset = parsed.EncoderPreset,
                 AudioTargetCodec = parsed.AudioTargetCodec,
@@ -144,6 +153,8 @@ internal static class LibraryEndpoints
                 RequireAudioRetained = parsed.RequireAudioRetained,
                 RequireSubtitlesRetained = parsed.RequireSubtitlesRetained,
                 RequireSizeReduction = parsed.RequireSizeReduction,
+                MinimumSizeSavingPercent = parsed.MinimumSizeSavingPercent,
+                MaximumSizeSavingPercent = parsed.MaximumSizeSavingPercent,
                 AudioLoudnessGateEnabled = parsed.AudioLoudnessGateEnabled,
                 MaxLoudnessDriftLufs = parsed.MaxLoudnessDriftLufs,
                 AudioClippingGateEnabled = parsed.AudioClippingGateEnabled,
@@ -152,6 +163,7 @@ internal static class LibraryEndpoints
                 MinimumImageSsim = parsed.MinimumImageSsim,
                 ImageMetadataGateEnabled = parsed.ImageMetadataGateEnabled,
                 VideoQualityStrategy = parsed.VideoQualityStrategy,
+                WorkPlacement = parsed.WorkPlacement,
                 AutoEnqueueEnabled = parsed.AutoEnqueueEnabled,
                 AutoEnqueueWindowStart = parsed.AutoEnqueueWindowStart,
                 AutoEnqueueWindowEnd = parsed.AutoEnqueueWindowEnd,
@@ -194,6 +206,9 @@ internal static class LibraryEndpoints
             library.Priority = parsed.Priority;
             library.MinFileSizeBytes = parsed.MinFileSizeBytes;
             library.MaxHeight = parsed.MaxHeight;
+            library.VideoDownscaleHeight = parsed.VideoDownscaleHeight;
+            library.MaxFrameRate = parsed.MaxFrameRate;
+            library.CropBlackBars = parsed.CropBlackBars;
             library.ReencodeSameCodecAboveBytes = parsed.ReencodeSameCodecAboveBytes;
             library.SkipEfficientSources = parsed.SkipEfficientSources;
             library.TargetVideoCodec = parsed.TargetVideoCodec;
@@ -201,6 +216,12 @@ internal static class LibraryEndpoints
             library.HdrHandling = parsed.HdrHandling;
             library.OptimiseDolbyVision = parsed.OptimiseDolbyVision;
             library.ExcludePaths = parsed.ExcludePaths;
+            library.ExcludeHardLinkedFiles = parsed.ExcludeHardLinkedFiles;
+            library.SkipSourceCodecs = parsed.SkipSourceCodecs;
+            library.ContentTune = parsed.ContentTune;
+            library.MaxBitrateKbps = parsed.MaxBitrateKbps;
+            library.MinBitrateKbps = parsed.MinBitrateKbps;
+            library.StrongerAdaptiveQuantisation = parsed.StrongerAdaptiveQuantisation;
             library.QualityCrf = parsed.QualityCrf;
             library.EncoderPreset = parsed.EncoderPreset;
             library.AudioTargetCodec = parsed.AudioTargetCodec;
@@ -229,6 +250,8 @@ internal static class LibraryEndpoints
             library.RequireAudioRetained = parsed.RequireAudioRetained;
             library.RequireSubtitlesRetained = parsed.RequireSubtitlesRetained;
             library.RequireSizeReduction = parsed.RequireSizeReduction;
+            library.MinimumSizeSavingPercent = parsed.MinimumSizeSavingPercent;
+            library.MaximumSizeSavingPercent = parsed.MaximumSizeSavingPercent;
             library.AudioLoudnessGateEnabled = parsed.AudioLoudnessGateEnabled;
             library.MaxLoudnessDriftLufs = parsed.MaxLoudnessDriftLufs;
             library.AudioClippingGateEnabled = parsed.AudioClippingGateEnabled;
@@ -237,6 +260,7 @@ internal static class LibraryEndpoints
             library.MinimumImageSsim = parsed.MinimumImageSsim;
             library.ImageMetadataGateEnabled = parsed.ImageMetadataGateEnabled;
             library.VideoQualityStrategy = parsed.VideoQualityStrategy;
+            library.WorkPlacement = parsed.WorkPlacement;
             library.AutoEnqueueEnabled = parsed.AutoEnqueueEnabled;
             library.AutoEnqueueWindowStart = parsed.AutoEnqueueWindowStart;
             library.AutoEnqueueWindowEnd = parsed.AutoEnqueueWindowEnd;

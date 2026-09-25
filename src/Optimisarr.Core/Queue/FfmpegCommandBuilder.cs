@@ -36,7 +36,33 @@ public sealed record TranscodeSpec(
     IReadOnlyList<int>? RemoveSubtitleStreamIndexes = null,
     // Disposable video calibration candidates compare picture quality only. Excluding audio,
     // subtitles, attachments, and data keeps their timing and size out of that judgement.
-    bool VideoOnly = false);
+    bool VideoOnly = false,
+    // Portable advanced encoder intent (content tune, bitrate cap, adaptive quantisation).
+    // Resolved onto this exact encoder's vocabulary by EncoderTuningPolicy, which drops anything
+    // the chosen family cannot express rather than approximating it.
+    EncoderTuning? Tuning = null,
+    // The exact size a video re-encode scales to, or null for none. Computed once by the resolver
+    // from the probed source so the filter emitted here and the verification gate share one
+    // number rather than each rounding for themselves. Meaningless for a copied stream.
+    PictureSize? DownscaleTo = null,
+    // The picture to keep when black bars are removed, in source coordinates, or null for none.
+    // Applied before any downscale, so a downscale is computed from the cropped size.
+    CropRect? CropTo = null,
+    // How a video re-encode thins its frames under a library's frame-rate cap, or null to keep
+    // the source cadence. Always a clean halving of the source (see FrameRatePlanner), and the
+    // same decimation the VMAF reference receives so the judged frames are the kept frames.
+    FrameRateDecimation? FrameRate = null)
+{
+    /// <summary>The rate a capped encode produces, or null when the source cadence is kept.</summary>
+    public double? TargetFrameRate => FrameRate?.TargetFps;
+
+    /// <summary>
+    /// The size this encode intends to produce, or null when it intends the source size. The
+    /// verification gate holds the output to this. A downscale already accounts for any crop.
+    /// </summary>
+    public PictureSize? ExpectedSize =>
+        DownscaleTo ?? (CropTo is { } crop ? new PictureSize(crop.Width, crop.Height) : null);
+}
 
 /// <summary>
 /// Builds the ffmpeg argument list for a transcode. Returns a flat argument array
@@ -111,7 +137,7 @@ public static class FfmpegCommandBuilder
         // A hardware tone-map consumes the decoded GPU surfaces directly. All other HDR-to-SDR
         // work retains the software colour pipeline and therefore needs system-memory frames.
         var useHardwareDecode = hardwareDecode
-            && family is EncoderFamily.Nvenc or EncoderFamily.Qsv or EncoderFamily.Vaapi
+            && family is EncoderFamily.Nvenc or EncoderFamily.Qsv or EncoderFamily.Vaapi or EncoderFamily.VideoToolbox
             && (!spec.TonemapToSdr || useHardwareToneMap);
 
         AppendHardwareDeviceInit(args, family, useHardwareDecode);
@@ -234,6 +260,15 @@ public static class FfmpegCommandBuilder
             args.Add("-0:d");
         }
 
+        if (!spec.VideoOnly && encoder == "av1_nvenc")
+        {
+            // Attached pictures are additional video streams. Copying one beside an AV1 NVENC
+            // encode has produced an output whose primary AV1 stream libdav1d cannot parse.
+            // Keep the real video and other mapped tracks, but drop only disposition-marked art.
+            args.Add("-map");
+            args.Add("-0:v:disp:attached_pic");
+        }
+
         // The tracks a kept-languages rule removes. The selection already guarantees at least
         // one audio track survives, and the verification gate re-checks the output against the
         // planned removal — this only translates the decided indexes into stream exclusions.
@@ -270,9 +305,27 @@ public static class FfmpegCommandBuilder
             return;
         }
 
-        // One filter chain: optional HDR->SDR tone-map, then any upload the hardware encoder
-        // needs. A supported hardware tone-map consumes the decoded GPU surfaces directly.
+        // One filter chain: optional downscale, optional HDR->SDR tone-map, then any upload the
+        // hardware encoder needs. A supported hardware tone-map consumes the decoded GPU surfaces
+        // directly. The downscale goes first: it is a software filter so it must precede any
+        // upload, and scaling before the tone-map does the expensive colour work on fewer pixels.
         var filters = new List<string>();
+        // Crop first, then scale: the downscale was computed from the cropped size, and scaling
+        // bars only to cut them away afterwards would waste the work and blur the edge.
+        if (spec.CropTo is { } crop)
+        {
+            filters.Add(CropPlanner.Filter(crop));
+        }
+        if (spec.DownscaleTo is { } downscale)
+        {
+            filters.Add(PictureGeometry.ScaleFilter(downscale));
+        }
+        // Decimate after the geometry and before the tone-map, so the expensive colour work runs
+        // only on the frames that survive.
+        if (spec.FrameRate is { } decimation)
+        {
+            filters.Add(FrameRatePlanner.Filter(decimation));
+        }
         if (spec.TonemapToSdr)
         {
             filters.Add(hardwareToneMap
@@ -318,22 +371,58 @@ public static class FfmpegCommandBuilder
         AppendQualityArguments(args, family, spec.Crf);
 
         // The dispatcher has already resolved the portable effort onto this exact encoder's
-        // vocabulary. VAAPI has no cross-codec equivalent and therefore receives no preset.
-        if (family != EncoderFamily.Vaapi && !string.IsNullOrWhiteSpace(spec.Preset))
+        // vocabulary. VAAPI and VideoToolbox have no cross-codec equivalent and receive no preset.
+        if (family is not (EncoderFamily.Vaapi or EncoderFamily.VideoToolbox)
+            && !string.IsNullOrWhiteSpace(spec.Preset))
         {
             args.Add("-preset");
             args.Add(spec.Preset);
         }
 
-        // Preserve a source that ffprobe positively identified as VFR. MP4 supports variable frame
-        // durations; forcing CFR duplicates/drops frames and changes motion cadence. Demux timebase
-        // keeps encoder timestamps anchored to the source. CFR and unknown sources need no override.
-        if (spec.SourceIsVariableFrameRate)
+        // Advanced encoder options, resolved for this exact encoder. A family with no equivalent
+        // contributes nothing here, so an Auto-mode library that lands on QSV simply encodes as it
+        // always did rather than receiving arguments it would reject.
+        if (spec.Tuning is { IsEmpty: false } tuning && encoder is not null)
         {
+            args.AddRange(EncoderTuningPolicy.Resolve(encoder, tuning));
+        }
+
+        // Every frame the source has, unless a frame-rate cap is deliberately changing the cadence.
+        //
+        // FFmpeg's default frame-rate handling drops frames whose timestamps collide, and it does
+        // that on sources ffprobe is perfectly happy to call constant. A VC-1 WEBRip declaring
+        // 25/1 for both avg_frame_rate and r_frame_rate lost eight frames in its first two hundred
+        // seconds — about fifty over an episode, gone from the library without a word.
+        //
+        // It also made the encode unmeasurable. Once the candidate has fewer frames than the
+        // source, frame N of one stops being frame N of the other and every windowed comparison
+        // comes apart: the same pair scored a harmonic mean of 9.4 against the source and 81
+        // against a reference cut the same lossy way. Whole seasons failed verification on quality
+        // that was never the problem.
+        //
+        // This used to apply only where ffprobe had positively identified a variable frame rate,
+        // which is the one case where the damage is obvious enough to have been noticed. The
+        // dangerous case is the source that looks regular and is not.
+        //
+        // A frame-rate target replaces the source cadence with a regular one through the fps
+        // filter; asking the encoder to also preserve the original timing would contradict it.
+        if (encoder is not null && spec.TargetFrameRate is null
+            && (encoder != "av1_nvenc" || spec.SourceIsVariableFrameRate))
+        {
+            // AV1 NVENC has emitted duplicate DTS for constant-rate H.264 with passthrough.
+            // Its default timestamp handling produced monotonic packets on that source. Keep
+            // passthrough for identified VFR sources and for other encoders, where dropping
+            // colliding frames has previously caused a real picture/quality regression.
             args.Add("-fps_mode");
-            args.Add("vfr");
-            args.Add("-enc_time_base:v:0");
-            args.Add("demux");
+            args.Add("passthrough");
+
+            // Keeps the encoder's timestamps anchored to the source's own timebase rather than a
+            // rounded one, which is what makes passthrough exact rather than merely close.
+            if (spec.SourceIsVariableFrameRate)
+            {
+                args.Add("-enc_time_base:v:0");
+                args.Add("demux");
+            }
         }
 
         // Audio is copied untouched unless the library opted into re-encoding it. MP4/MOV
@@ -495,13 +584,20 @@ public static class FfmpegCommandBuilder
 
     // The hardware family is inferred from the resolved encoder name, so quality and device
     // arguments stay correct whatever codec was selected (e.g. h264_vaapi vs hevc_vaapi).
-    private enum EncoderFamily { Cpu, Nvenc, Qsv, Vaapi }
+    private enum EncoderFamily { Cpu, Nvenc, Qsv, Vaapi, VideoToolbox }
 
     private static EncoderFamily FamilyOf(string encoder) =>
         encoder.EndsWith("_nvenc", StringComparison.OrdinalIgnoreCase) ? EncoderFamily.Nvenc
         : encoder.EndsWith("_qsv", StringComparison.OrdinalIgnoreCase) ? EncoderFamily.Qsv
         : encoder.EndsWith("_vaapi", StringComparison.OrdinalIgnoreCase) ? EncoderFamily.Vaapi
+        : encoder.EndsWith("_videotoolbox", StringComparison.OrdinalIgnoreCase) ? EncoderFamily.VideoToolbox
         : EncoderFamily.Cpu;
+
+    // Apple's encoders take constant quality as -q:v on a 1–100 scale where higher is better, the
+    // inverse of CRF. A straight line through the two ranges keeps the operator's number meaning
+    // "lower is better" everywhere else; the VMAF gate, not this mapping, is what guarantees the
+    // result, and real-hardware calibration of the line is still owed (see the roadmap).
+    private static int VideoToolboxQuality(int crf) => Math.Clamp(100 - 2 * crf, 1, 100);
 
     // VAAPI/QSV need a hardware device declared before the input. The render node is the
     // conventional default; CUDA uses the first GPU exposed to the container.
@@ -519,6 +615,14 @@ public static class FfmpegCommandBuilder
                 args.Add("cuda");
                 args.Add("-hwaccel_output_format");
                 args.Add("cuda");
+                break;
+            case EncoderFamily.VideoToolbox when hardwareDecode:
+                // Decode with VideoToolbox but leave the frames in system memory: without an
+                // output format ffmpeg downloads them, so every software filter here still works
+                // and the encoder uploads once. Apple's zero-copy path is not needed for the
+                // encoder to be fast, and a proven software-filter graph is worth more.
+                args.Add("-hwaccel");
+                args.Add("videotoolbox");
                 break;
             case EncoderFamily.Vaapi:
                 args.Add("-vaapi_device");
@@ -571,6 +675,9 @@ public static class FfmpegCommandBuilder
                 break;
             case EncoderFamily.Vaapi:
                 args.AddRange(["-rc_mode", "CQP", "-qp", q]);
+                break;
+            case EncoderFamily.VideoToolbox:
+                args.AddRange(["-q:v", VideoToolboxQuality(quality).ToString()]);
                 break;
             default:
                 args.AddRange(["-crf", q]);

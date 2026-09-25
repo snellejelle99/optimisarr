@@ -17,7 +17,33 @@ public enum JobStatus
     ReadyToReplace = 4,
     Completed = 5,
     Failed = 6,
-    Cancelled = 7
+    Cancelled = 7,
+
+    /// <summary>
+    /// Claimed by a remote worker and being transcoded off this machine.
+    ///
+    /// A distinct status rather than a flag or a join, so the local dispatcher — which selects on
+    /// <see cref="Queued"/> — cannot pick the job up as well. The exclusion is then structural: a
+    /// future query cannot forget to check for a lease, because a leased job simply is not queued.
+    /// </summary>
+    Leased = 8,
+
+    /// <summary>
+    /// A remote worker has delivered its candidate and this machine has not yet verified it.
+    ///
+    /// Distinct from <see cref="Verifying"/> on purpose. That status means verification is
+    /// running here right now, and restart recovery rightly treats it as interrupted work whose
+    /// output is discarded; a delivered candidate is finished work that must survive a restart
+    /// and wait for the dispatcher to pick it up. Nothing about a candidate in this state is
+    /// trusted yet: every local gate is still to run before it can become a replacement.
+    /// </summary>
+    AwaitingVerification = 9,
+
+    /// <summary>
+    /// Quality samples predict that a full video encode would miss the required size saving by
+    /// a wide margin. No full candidate exists; the operator can approve one attempt anyway.
+    /// </summary>
+    AwaitingSizeReview = 10
 }
 
 /// <summary>
@@ -58,6 +84,15 @@ public sealed class Job
 
     /// <summary>How many times this job has been started; incremented on crash recovery.</summary>
     public int Attempt { get; set; }
+
+    /// <summary>Human-facing execution number, including both local starts and worker leases.</summary>
+    public int ExecutionAttempt { get; set; }
+
+    /// <summary>Durable snapshots of attempts superseded by a retry, serialised as JSON.</summary>
+    public string? AttemptHistoryJson { get; set; }
+
+    /// <summary>Why the current attempt was queued again; null for ordinary first attempts.</summary>
+    public string? RetryReason { get; set; }
 
     /// <summary>
     /// Why this job was enqueued — the eligibility reason computed at enqueue time
@@ -100,6 +135,21 @@ public sealed class Job
     /// silently reverting to the library baseline.
     /// </summary>
     public int? AdaptiveVideoQuality { get; set; }
+
+    /// <summary>
+    /// The operator approved a full encode despite a sample-based size warning. The final size
+    /// and quality gates still apply; this only prevents the advisory preflight from holding the
+    /// same job again when it is requeued or recovered.
+    /// </summary>
+    public bool BypassSizePreflight { get; set; }
+
+    /// <summary>
+    /// The black-bar crop decided for this title as <c>width:height:x:y</c>, or <c>none</c> when
+    /// detection ran and found no bars worth removing. Null means detection has not run. Persisted
+    /// for the same reason as <see cref="AdaptiveVideoQuality"/>: a crash, automatic, or operator
+    /// retry must encode the same picture the verified attempt did, not re-detect and drift.
+    /// </summary>
+    public string? DetectedCrop { get; set; }
 
     /// <summary>Encoder quality mode shown to the operator (CRF, ICQ, CQ, or QP).</summary>
     public string? VideoQualityMode { get; set; }
@@ -148,6 +198,16 @@ public sealed class Job
     /// </summary>
     public string? ProcessLog { get; set; }
 
+    /// <summary>
+    /// SHA-256 of the source as it was when a remote worker first fetched it.
+    ///
+    /// Computed once and kept, because hashing a multi-gigabyte file is not something to repeat per
+    /// request. It is what later binds a returned candidate and its quality evidence to the exact
+    /// bytes that were encoded: a result measured against a different source is not evidence about
+    /// this one.
+    /// </summary>
+    public string? SourceSha256 { get; set; }
+
     // --- Verification (Phase 4: populated once the output has been verified) ---
 
     /// <summary>Size of the produced output in bytes, recorded at verification time.</summary>
@@ -160,6 +220,13 @@ public sealed class Job
     public string? VerificationReportJson { get; set; }
 
     public DateTimeOffset? VerifiedAt { get; set; }
+
+    /// <summary>
+    /// Set when a hardware-decoded candidate for this job failed verification with the signature
+    /// of decoder corruption, so the next attempt — here or on a worker — decodes in software. The
+    /// local path retries within one run; a remote job cannot, so the fact is kept on the job.
+    /// </summary>
+    public bool PreferSoftwareDecode { get; set; }
 
     public DateTimeOffset EnqueuedAt { get; set; } = DateTimeOffset.UtcNow;
 

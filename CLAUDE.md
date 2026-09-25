@@ -21,7 +21,13 @@ Optimisarr's entire reason to exist is that it is safer than the alternatives.
   promise. Any change that could break it must be rejected.
 - Every destructive action (replace, delete, move-to-trash) must have a recorded
   rollback path before it runs, not after.
-- Defaults are conservative. When in doubt, do nothing and report why.
+- Defaults are conservative. When in doubt, do nothing and report why. There is
+  one recorded exception — Adaptive per-title VMAF is the default for new video
+  re-encode libraries while still labelled Experimental. It is deliberate and its
+  reasoning is documented in
+  [`docs/roadmap.md`](docs/roadmap.md) under adaptive per-title VMAF quality
+  targeting. Do not treat it as licence to default other unproven paths on;
+  a new exception needs the same explicit reasoning and a matching record.
 - FFmpeg/ffprobe are invoked through explicit argument arrays
   (`ProcessStartInfo.ArgumentList`), **never** a shell string and never string
   interpolation of a path. Treat every file path as untrusted input.
@@ -117,7 +123,9 @@ A change is done when **all** of these hold:
 
 1. `dotnet build` succeeds with **zero warnings**.
 2. `dotnet test` is fully green, and new behaviour has new tests.
-3. `npm run check` is clean if the frontend changed.
+3. `npm run check` is clean if the frontend changed, and `npm run test:e2e` passes. The e2e
+   suite catches whole classes of breakage the type checker cannot — a two-way binding onto
+   an absent prop throws at runtime and blanks a page while `npm run check` stays clean.
 4. Schema changes have a migration and re-running them is a no-op.
 5. The safety model is intact (or strengthened) — never weakened.
 6. `CHANGELOG.md` (Unreleased section) records the change.
@@ -150,9 +158,24 @@ Then:
 ```bash
 dotnet build Optimisarr.slnx          # build everything
 dotnet test  Optimisarr.slnx          # run the suite
+python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 cd web && npm run check               # frontend type/lint check
+cd web && npm run test:e2e            # Playwright end-to-end suite (CI gate — run it)
 cd web && npm run build               # emits static assets into Optimisarr.Api/wwwroot
+cd sidecars/macos && swift test        # macOS sidecar protocol and lifecycle suite
+cd sidecars/macos && swift build -c release
 ```
+
+The final-image gate also runs real application media workflows:
+
+```bash
+docker build -t optimisarr:acceptance .
+python3 scripts/media_acceptance.py --image optimisarr:acceptance \
+  --root /tmp/optimisarr-acceptance-run --tier smoke
+```
+
+Use a new root for each run. See [the acceptance guide](docs/development/media-acceptance.md)
+for independent VMAF evidence, freely licensed fixtures, and isolated hardware-worker runs.
 
 ## 8. Project layout
 
@@ -179,7 +202,12 @@ to `dev`/`main`, every tag `v*`, and every pull request targeting `dev`/`main`:
 - **backend** — `dotnet restore` → `dotnet build … -warnaserror` → `dotnet test`.
   The `-warnaserror` flag makes the §6 zero-warnings rule a hard gate; a warning
   fails the build. Do not silence it.
-- **frontend** — `npm ci` → `npm run check`. Must be clean.
+- **frontend** — `npm ci` → `npm run check` → `npx playwright install chromium` →
+  `npm run test:e2e`. Both must be clean. The end-to-end suite is a gate, not an optional
+  extra, so run it locally before pushing rather than discovering it here.
+- **macos-sidecar** — `swift test` → release build on an Apple Silicon macOS runner. Live
+  VideoToolbox and server tests remain explicit hardware acceptance runs because CI does not bundle
+  the sidecar's pinned FFmpeg or provision a paired Optimisarr server.
 - **docker** — builds the image (after backend + frontend pass) and **publishes
   to GHCR** as `ghcr.io/jellman86/optimisarr`.
 - [`.github/workflows/security.yml`](.github/workflows/security.yml) checks the
@@ -229,8 +257,6 @@ the repo's package settings if anonymous `docker pull` is expected.
 - Pull requests state the outcome, included and excluded scope, verification
   results, and material safety or migration risk. Do not merge while a required
   check is failing or a blocking review conversation is unresolved.
-- **No sub-agents.** Do the work inline. Do not spawn sub-agents (e.g. the Agent/Task
-  "Explore"/"Plan"/general-purpose agents) to carry out tasks in this repo.
 - **Write GitHub Releases for the person updating their server, not for the commit
   history.** Follow [`docs/development/releasing.md`](docs/development/releasing.md)
   and start from [`.github/RELEASE_NOTES_TEMPLATE.md`](.github/RELEASE_NOTES_TEMPLATE.md).

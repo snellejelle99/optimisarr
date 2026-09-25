@@ -16,7 +16,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -26,6 +26,9 @@ public sealed class MigrationTests : IDisposable
 
         db.AppSettings.Add(new AppSetting { Key = "migration.smoke", Value = "ok" });
         await db.SaveChangesAsync();
+        var applied = (await db.Database.GetAppliedMigrationsAsync()).ToArray();
+        await db.Database.MigrateAsync();
+        Assert.Equal(applied, (await db.Database.GetAppliedMigrationsAsync()).ToArray());
         Assert.Equal("ok", (await db.AppSettings.SingleAsync()).Value);
     }
 
@@ -34,7 +37,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -62,7 +65,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -90,7 +93,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -137,7 +140,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -190,7 +193,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -253,7 +256,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -312,7 +315,7 @@ public sealed class MigrationTests : IDisposable
     {
         Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
         var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
-            .UseSqlite($"Data Source={_dbPath}")
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
             .Options;
 
         await using var db = new OptimisarrDbContext(options);
@@ -342,6 +345,49 @@ public sealed class MigrationTests : IDisposable
         Assert.True(films.ImageQualityGateEnabled);
         Assert.Equal(0.95, films.MinimumImageSsim);
         Assert.True(films.ImageMetadataGateEnabled);
+    }
+
+    [Fact]
+    public async Task An_upgraded_library_materialises_a_readable_content_tune()
+    {
+        // The generated migration defaulted the new enum column to "", which is not a member and
+        // throws on materialisation — every existing library would fail to load. This proves the
+        // corrected "None" default actually reads back through the string converter.
+        Directory.CreateDirectory(Path.GetDirectoryName(_dbPath)!);
+        var options = new DbContextOptionsBuilder<OptimisarrDbContext>()
+            .UseSqlite($"Data Source={_dbPath};Pooling=False")
+            .Options;
+
+        await using var db = new OptimisarrDbContext(options);
+        var migrator = db.Database.GetService<Microsoft.EntityFrameworkCore.Migrations.IMigrator>();
+        await migrator.MigrateAsync("20260824191153_AddJobSourceHash");
+        await db.Database.ExecuteSqlRawAsync(
+            """
+            INSERT INTO Libraries
+                (Name, Path, MediaType, RuleProfile, Enabled, CreatedAt, UpdatedAt)
+            VALUES
+                ('Films', '/data/films', 'Film', 'ConservativeHevc', 1,
+                 '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00');
+            """);
+
+        await migrator.MigrateAsync();
+        db.ChangeTracker.Clear();
+
+        var films = await db.Libraries.SingleAsync();
+        Assert.Equal(Optimisarr.Core.Queue.ContentTune.None, films.ContentTune);
+        Assert.Null(films.MaxBitrateKbps);
+        Assert.False(films.StrongerAdaptiveQuantisation);
+        // And the exclusions from the same release upgrade to their off state.
+        Assert.False(films.ExcludeHardLinkedFiles);
+        Assert.Null(films.SkipSourceCodecs);
+        // The later slices — bitrate floor, downscale, black-bar crop — likewise arrive off. A
+        // library that never asked for any of this must encode exactly as it did before upgrading.
+        Assert.Null(films.MinBitrateKbps);
+        Assert.Null(films.VideoDownscaleHeight);
+        Assert.False(films.CropBlackBars);
+        Assert.Null(films.MaxFrameRate);
+        // And placement arrives as "anywhere": exactly how jobs were placed before the choice.
+        Assert.Equal(Optimisarr.Core.Queue.WorkPlacement.Anywhere, films.WorkPlacement);
     }
 
     public void Dispose()

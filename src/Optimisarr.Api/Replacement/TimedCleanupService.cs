@@ -181,6 +181,8 @@ public sealed class TimedCleanupService
                         || job.Status == JobStatus.Probing
                         || job.Status == JobStatus.Transcoding
                         || job.Status == JobStatus.Verifying
+                        || job.Status == JobStatus.AwaitingVerification
+                        || job.Status == JobStatus.AwaitingSizeReview
                         || job.Status == JobStatus.ReadyToReplace))
                 .Select(job => job.WorkOutputPath!)
                 .ToListAsync(cancellationToken))
@@ -394,6 +396,8 @@ public sealed class TimedCleanupService
                 || job.Status == JobStatus.Probing
                 || job.Status == JobStatus.Transcoding
                 || job.Status == JobStatus.Verifying
+                || job.Status == JobStatus.AwaitingVerification
+                || job.Status == JobStatus.AwaitingSizeReview
                 || job.Status == JobStatus.ReadyToReplace),
             cancellationToken);
 

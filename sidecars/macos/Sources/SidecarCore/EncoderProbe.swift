@@ -1,0 +1,165 @@
+import Foundation
+
+/// Parses `ffmpeg -encoders` output.
+///
+/// Listing is only the cheap first pass. The server's `HardwareCapabilityService` takes the same
+/// two-stage approach — parse, then confirm each hardware encoder with a real test encode — because
+/// ffmpeg lists what it was compiled with, not what this machine can actually open. A VideoToolbox
+/// encoder is present in every build for Apple platforms and can still fail at runtime, which is
+/// exactly why the roadmap says to probe rather than assume.
+public enum EncoderListParser {
+    /// Encoders worth reporting. Deliberately narrow: advertising an encoder the server would never
+    /// ask for only invites work this sidecar has no better claim to than the container.
+    static let interesting: Set<String> = [
+        "libx264", "libx265", "libsvtav1",
+        "h264_videotoolbox", "hevc_videotoolbox",
+    ]
+
+    /// `ffmpeg -encoders` prints a header, a separator line of dashes, then one row per encoder:
+    ///
+    ///     V....D hevc_videotoolbox    VideoToolbox H.265 Encoder
+    ///
+    /// The leading flags column starts with the media type, so video encoders begin with `V`.
+    public static func parse(_ output: String) -> [String] {
+        var found: [String] = []
+
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+
+            // Skip the header block; rows only start after the dashed separator, and every real row
+            // carries a flags column followed by the name.
+            let parts = trimmed.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard parts.count >= 2 else { continue }
+
+            let flags = String(parts[0])
+            let name = String(parts[1])
+
+            guard flags.hasPrefix("V"), interesting.contains(name), !found.contains(name) else {
+                continue
+            }
+            found.append(name)
+        }
+
+        return found
+    }
+
+    /// Every encoder needs proving. Listing only says ffmpeg was compiled with it: a VideoToolbox
+    /// encoder can fail to open on a given machine, and a bundled software encoder can be broken
+    /// outright — the vendored libx265 segfaulted on its first frame on 2026-09-13 while this
+    /// sidecar, trusting the listing for CPU encoders, went on advertising it. The throwaway
+    /// encode costs well under a second per encoder and runs once per launch.
+    public static func needsConfirmation(_ encoder: String) -> Bool {
+        _ = encoder
+        return true
+    }
+}
+
+/// Parses `ffmpeg -encoders` for the audio encoders the server is able to ask for.
+///
+/// Deliberately narrow, and deliberately matched to the server's own list. Optimisarr can target
+/// AAC, Opus or MP3, which it emits as `aac`, `libopus` and `libmp3lame`. The bundled FFmpeg is
+/// built with none of the external audio libraries, so it carries `aac` and neither of the other
+/// two — advertising them would hand this machine a job it can only fail with "Unknown encoder".
+public enum AudioEncoderListParser {
+    static let interesting: Set<String> = ["aac", "libopus", "libmp3lame", "ac3", "eac3", "flac", "alac"]
+
+    /// Audio rows begin with `A` in the flags column, the same shape as the video listing.
+    public static func parse(_ output: String) -> [String] {
+        var found: [String] = []
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            let parts = line.trimmingCharacters(in: .whitespaces)
+                .split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
+            guard parts.count >= 2 else { continue }
+            let name = String(parts[1])
+            guard String(parts[0]).hasPrefix("A"), interesting.contains(name), !found.contains(name) else {
+                continue
+            }
+            found.append(name)
+        }
+        return found
+    }
+}
+
+/// Builds the throwaway encode that proves an encoder actually opens on this machine.
+///
+/// Mirrors the server's `EncoderProbeCommand`: a few frames of a synthetic source to the null
+/// muxer, at a resolution large enough to clear encoder minimums rather than a thumbnail. A clean
+/// exit means the encoder opened and produced packets.
+public enum EncoderProbeCommand {
+    public static func arguments(for encoder: String) -> [String] {
+        [
+            "-hide_banner", "-v", "error",
+            "-f", "lavfi", "-i", "color=c=black:s=320x240:r=25:d=0.2",
+            "-frames:v", "3",
+            "-c:v", encoder,
+            "-f", "null", "-",
+        ]
+    }
+}
+
+/// The throwaway encode that proves an audio encoder opens.
+///
+/// A second of silence is enough: the failure being guarded against is the encoder not existing or
+/// refusing to open, which happens on the first frame.
+public enum AudioEncoderProbeCommand {
+    public static func arguments(for encoder: String) -> [String] {
+        [
+            "-hide_banner", "-v", "error",
+            "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=0.2",
+            "-c:a", encoder,
+            "-f", "null", "-",
+        ]
+    }
+}
+
+/// Parses `ffmpeg -filters` to decide whether VMAF can be measured.
+///
+/// Apple GPUs have no VMAF compute backend, so the only honest answer here is CPU or nothing —
+/// there is no arrangement of Apple hardware that yields `Cuda`.
+public enum VmafSupportParser {
+    public static func parse(_ filtersOutput: String) -> VmafCapability {
+        filtersOutput.contains("libvmaf") ? .cpu : .none
+    }
+}
+
+/// Parses `ffmpeg -hwaccels`.
+///
+/// On Apple the only entry that matters is `videotoolbox`, which covers hardware decode. Unlike an
+/// encoder there is no per-codec decoder name to advertise — decode is requested as
+/// `-hwaccel videotoolbox` — so that is the name reported, and it is reported only once a real
+/// decode has been shown to work.
+public enum HardwareAcceleratorParser {
+    public static func parse(_ output: String) -> [String] {
+        output
+            .split(separator: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { $0 == "videotoolbox" }
+    }
+}
+
+/// Builds the round trip that proves hardware decode actually works.
+///
+/// Listing `videotoolbox` under `-hwaccels` only says ffmpeg was compiled for it. Proving it needs
+/// something real to decode, so a short clip is encoded first and then decoded back with the
+/// accelerator engaged. Both halves have to succeed, which is stricter than either alone.
+public enum HardwareDecodeProbeCommand {
+    /// Encodes a throwaway clip to a file, using the hardware encoder already proved.
+    public static func encodeArguments(to path: String, using encoder: String) -> [String] {
+        [
+            "-hide_banner", "-v", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc=s=320x240:r=25:d=1",
+            "-c:v", encoder,
+            path,
+        ]
+    }
+
+    /// Decodes it back with the accelerator engaged, to the null muxer.
+    public static func decodeArguments(from path: String) -> [String] {
+        [
+            "-hide_banner", "-v", "error",
+            "-hwaccel", "videotoolbox",
+            "-i", path,
+            "-f", "null", "-",
+        ]
+    }
+}

@@ -1,4 +1,5 @@
 using Optimisarr.Core.Domain;
+using Optimisarr.Core.Queue;
 using Optimisarr.Core.Verification;
 
 namespace Optimisarr.Tests;
@@ -465,6 +466,171 @@ public sealed class VerificationEvaluatorTests
     }
     // A converted output that passes every default gate: decodes cleanly, probes,
     // keeps duration and audio, and is meaningfully smaller than the original.
+    // --- Intended resolution ------------------------------------------------------------------
+    //
+    // The stream-structure gate has always required output dimensions to equal the source's, and
+    // its own failure message named "a resize policy" that did not exist. These give it one: when
+    // an encode intended to produce a particular size, the gate checks the output against that
+    // intent rather than against the source.
+
+    [Fact]
+    public void An_output_at_the_intended_size_passes_the_structure_gate()
+    {
+        var input = Healthy() with
+        {
+            OriginalWidth = 1920, OriginalHeight = 1080,
+            OutputWidth = 1280, OutputHeight = 720,
+            ExpectedWidth = 1280, ExpectedHeight = 720
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.True(report.Passed, string.Join(" | ", report.Checks.Where(c => c.Outcome != CheckOutcome.Passed).Select(c => c.Detail)));
+    }
+
+    [Fact]
+    public void An_output_that_misses_the_intended_size_fails_and_names_what_was_intended()
+    {
+        // The encoder produced something other than what was asked for. Naming the intended size
+        // is what makes the failure actionable; "changed from the source" would be true but useless.
+        var input = Healthy() with
+        {
+            OriginalWidth = 1920, OriginalHeight = 1080,
+            OutputWidth = 1282, OutputHeight = 720,
+            ExpectedWidth = 1280, ExpectedHeight = 720
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.False(report.Passed);
+        var failure = Assert.Single(report.Checks, c => c.Outcome == CheckOutcome.Failed);
+        Assert.Contains("1280x720", failure.Detail);
+        Assert.Contains("1282x720", failure.Detail);
+    }
+
+    [Fact]
+    public void An_output_at_the_source_size_fails_when_a_downscale_was_intended()
+    {
+        // The scale filter was dropped somewhere — a hardware path that ignored it, say. The file
+        // is fine as a file, but it is not the job that was asked for, and it must not be the one
+        // that replaces the original under the belief that it is smaller.
+        var input = Healthy() with
+        {
+            OriginalWidth = 1920, OriginalHeight = 1080,
+            OutputWidth = 1920, OutputHeight = 1080,
+            ExpectedWidth = 1280, ExpectedHeight = 720
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.False(report.Passed);
+    }
+
+    [Fact]
+    public void An_output_at_the_intended_frame_rate_passes_within_probe_rounding()
+    {
+        // ffprobe reports 29.97 as 30000/1001; the planner computed 59.94/2. Neither is wrong, and
+        // the gate must not fail an encode over the fourth decimal place.
+        var input = Healthy() with { ExpectedFrameRate = 29.97, OutputFrameRate = 30000.0 / 1001 };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.True(report.Passed, string.Join(" | ", report.Checks.Where(c => c.Outcome != CheckOutcome.Passed).Select(c => c.Detail)));
+    }
+
+    [Fact]
+    public void An_output_at_the_source_rate_fails_when_a_decimation_was_intended()
+    {
+        // The fps filter was dropped somewhere. The file is fine as a file, but it is not the job
+        // that was asked for, and the failure names what was intended so it is actionable.
+        var input = Healthy() with { ExpectedFrameRate = 30, OutputFrameRate = 60 };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.False(report.Passed);
+        var failure = Assert.Single(report.Checks, c => c.Outcome == CheckOutcome.Failed);
+        Assert.Contains("60 fps", failure.Detail);
+        Assert.Contains("intended 30 fps", failure.Detail);
+    }
+
+    [Fact]
+    public void An_unreadable_output_frame_rate_fails_when_a_decimation_was_intended()
+    {
+        // Not knowing is not passing: the gate exists to prove the decimation happened.
+        var input = Healthy() with { ExpectedFrameRate = 30, OutputFrameRate = null };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.False(report.Passed);
+    }
+
+    [Fact]
+    public void Without_an_intended_frame_rate_the_rate_is_not_judged()
+    {
+        // Exactly as before this existed: a library with no cap never had its frame rate checked,
+        // and a VFR source whose average rate drifts must keep passing.
+        var input = Healthy() with { ExpectedFrameRate = null, OutputFrameRate = 24.5 };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.True(report.Passed, string.Join(" | ", report.Checks.Where(c => c.Outcome != CheckOutcome.Passed).Select(c => c.Detail)));
+    }
+
+    [Fact]
+    public void An_intended_frame_rate_never_applies_to_a_copied_video_stream()
+    {
+        // A remux cannot drop frames, so a stray expectation must not fail a copied stream over
+        // its rate. The codec fields match because a copy keeps the source codec.
+        var input = Healthy() with
+        {
+            VideoReencoded = false,
+            ExpectedVideoCodec = null,
+            OutputVideoCodec = "h264",
+            ExpectedFrameRate = 30,
+            OutputFrameRate = 60
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.DoesNotContain(report.Checks, c => c.Outcome == CheckOutcome.Failed && c.Detail.Contains("frame rate"));
+    }
+
+    [Fact]
+    public void Without_an_intended_size_the_gate_still_requires_the_source_size()
+    {
+        // No policy means no resize, exactly as before this existed. Every library that never sets
+        // a downscale keeps the behaviour it always had.
+        var input = Healthy() with
+        {
+            OriginalWidth = 1920, OriginalHeight = 1080,
+            OutputWidth = 1280, OutputHeight = 720,
+            ExpectedWidth = null, ExpectedHeight = null
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.False(report.Passed);
+        Assert.Contains(report.Checks, c => c.Outcome == CheckOutcome.Failed && c.Detail.Contains("without a resize policy"));
+    }
+
+    [Fact]
+    public void An_intended_size_never_applies_to_a_copied_video_stream()
+    {
+        // A remux cannot resize. If an intended size somehow reaches a copy job, the safe reading
+        // is that the stream must be untouched — not that a size change is now acceptable.
+        var input = Healthy() with
+        {
+            VideoReencoded = false,
+            OriginalWidth = 1920, OriginalHeight = 1080,
+            OutputWidth = 1280, OutputHeight = 720,
+            ExpectedWidth = 1280, ExpectedHeight = 720
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.False(report.Passed);
+    }
+
     private static VerificationInput Healthy() => new(
         DecodeSucceeded: true,
         DecodeError: null,
@@ -735,6 +901,55 @@ public sealed class VerificationEvaluatorTests
     }
 
     [Fact]
+    public void An_indeterminate_source_packet_scan_blocks_replacement_without_claiming_corruption()
+    {
+        var input = Healthy() with
+        {
+            OriginalDurationSeconds = 1279.24,
+            OutputDurationSeconds = 1279.24,
+            OriginalTimestampsMeasured = true,
+            OriginalLastPresentationSeconds = 0.08,
+            OriginalAudioLastPresentationSeconds = 1277.27,
+            OutputLastPresentationSeconds = 1279.24,
+            TimestampsMeasured = true,
+            SourceTimelineIndeterminate = true
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.False(report.Passed);
+        var check = report.Checks.Single(item => item.Name == VerificationEvaluator.SourceVideoTimelineCheckName);
+        Assert.Equal(CheckOutcome.Failed, check.Outcome);
+        Assert.Contains("indeterminate", check.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("0.08s", check.Detail);
+        Assert.DoesNotContain("corrupt", check.Detail, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(report.Checks, item => item.Name == "Tail integrity");
+        Assert.False(HardwareDecodeFallback.ShouldRetryAfterVerification(report, catastrophicFloor: 40));
+    }
+
+    [Fact]
+    public void An_incomplete_source_with_catastrophic_vmaf_stays_failed_without_a_futile_retry()
+    {
+        var input = Healthy() with
+        {
+            OriginalTimestampsMeasured = true,
+            OriginalLastPresentationSeconds = 2898.395,
+            OriginalAudioLastPresentationSeconds = 3268.863,
+            OutputLastPresentationSeconds = 2898.395,
+            TimestampsMeasured = true,
+            QualityScores = new QualityScores(75, 40, 0, null, null)
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default with { QualityGateEnabled = true });
+
+        Assert.False(report.Passed);
+        Assert.Equal(CheckOutcome.Failed, Outcome(report, VerificationEvaluator.SourceVideoTimelineCheckName));
+        Assert.Equal(CheckOutcome.Failed, Outcome(report, "Perceptual quality (VMAF)"));
+        Assert.False(HardwareDecodeFallback.ShouldRetryAfterVerification(report, catastrophicFloor: 40));
+        Assert.False(VmafRetryPolicy.ShouldRetry(report, retryCount: 0, effectiveQuality: 38));
+    }
+
+    [Fact]
     public void A_subtitle_longer_than_the_picture_does_not_make_a_complete_source_look_corrupt()
     {
         var input = Healthy() with
@@ -753,6 +968,31 @@ public sealed class VerificationEvaluatorTests
         Assert.True(report.Passed);
         Assert.Equal(CheckOutcome.Passed, Outcome(report, "Duration"));
         Assert.Equal(CheckOutcome.Passed, Outcome(report, "Source video timeline"));
+        Assert.Equal(CheckOutcome.Passed, Outcome(report, "Tail integrity"));
+    }
+
+    [Fact]
+    public void Packet_derived_video_and_audio_spans_keep_an_aligned_long_gop_source_valid()
+    {
+        // A VFR/long-GOP stream need not begin at container time zero. Compare each stream's
+        // packet endpoint against its own first presentation time, not the format duration.
+        var input = Healthy() with
+        {
+            OriginalDurationSeconds = 3600,
+            OutputDurationSeconds = 3600,
+            OriginalTimestampsMeasured = true,
+            OriginalVideoStartSeconds = 0.083,
+            OriginalLastPresentationSeconds = 3600.083,
+            OriginalAudioStartSeconds = 0.021,
+            OriginalAudioLastPresentationSeconds = 3600.021,
+            TimestampsMeasured = true,
+            OutputVideoStartSeconds = 0.083,
+            OutputLastPresentationSeconds = 3600.083
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.Equal(CheckOutcome.Passed, Outcome(report, VerificationEvaluator.SourceVideoTimelineCheckName));
         Assert.Equal(CheckOutcome.Passed, Outcome(report, "Tail integrity"));
     }
 
@@ -953,6 +1193,40 @@ public sealed class VerificationEvaluatorTests
             "Size saving"));
     }
 
+    [Theory]
+    [InlineData(900_000_000L, CheckOutcome.Passed)]
+    [InlineData(900_000_001L, CheckOutcome.Failed)]
+    public void Optional_minimum_useful_saving_is_an_exact_video_reencode_gate(
+        long outputBytes, CheckOutcome expected)
+    {
+        var input = Healthy() with { OutputSizeBytes = outputBytes };
+        var policy = VerificationPolicy.Default with { MinimumSizeSavingPercent = 10 };
+
+        Assert.Equal(expected, Outcome(VerificationEvaluator.Evaluate(input, policy), "Size saving"));
+        Assert.Equal(CheckOutcome.Passed, Outcome(VerificationEvaluator.Evaluate(
+            input, policy with { RequireSizeReduction = false }), "Size saving"));
+        Assert.Equal(CheckOutcome.Passed, Outcome(VerificationEvaluator.Evaluate(
+            input with { VideoReencoded = false }, policy), "Size saving"));
+    }
+
+    [Theory]
+    [InlineData(350_000_000L, CheckOutcome.Passed)]
+    [InlineData(349_999_999L, CheckOutcome.Failed)]
+    public void Optional_maximum_saving_rejects_over_compression_for_video_reencodes(
+        long outputBytes, CheckOutcome expected)
+    {
+        var input = Healthy() with { OutputSizeBytes = outputBytes };
+        var policy = VerificationPolicy.Default with { MaximumSizeSavingPercent = 65 };
+
+        Assert.Equal(expected, Outcome(VerificationEvaluator.Evaluate(input, policy), "Compression ceiling"));
+        Assert.DoesNotContain(VerificationEvaluator.Evaluate(input,
+            policy with { MaximumSizeSavingPercent = null }).Checks, check => check.Name == "Compression ceiling");
+        Assert.DoesNotContain(VerificationEvaluator.Evaluate(input,
+            policy with { RequireSizeReduction = false }).Checks, check => check.Name == "Compression ceiling");
+        Assert.DoesNotContain(VerificationEvaluator.Evaluate(input with { VideoReencoded = false },
+            policy).Checks, check => check.Name == "Compression ceiling");
+    }
+
     [Fact]
     public void Empty_output_fails_the_size_check()
     {
@@ -1083,6 +1357,72 @@ public sealed class VerificationEvaluatorTests
     }
 
     [Fact]
+    public void Standard_definition_smpte170m_is_preserved_without_a_tone_map()
+    {
+        var input = Healthy() with
+        {
+            OriginalColorPrimaries = "smpte170m", OutputColorPrimaries = "smpte170m",
+            OriginalColorTransfer = "smpte170m", OutputColorTransfer = "smpte170m",
+            OriginalColorSpace = "smpte170m", OutputColorSpace = "smpte170m",
+            OriginalColorRange = "tv", OutputColorRange = "tv"
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.Equal(CheckOutcome.Passed, Outcome(report, ColorCheck));
+        Assert.Equal("smpte170m", report.Colour?.Expected.Primaries);
+        Assert.Equal("tv", report.Colour?.Output.Range);
+        Assert.False(report.Colour?.ToneMapped);
+        Assert.Contains("expected primaries=smpte170m", report.Checks.Single(check => check.Name == ColorCheck).Detail);
+    }
+
+    [Fact]
+    public void Sd_videotoolbox_transfer_alias_does_not_count_as_colour_conversion()
+    {
+        var input = Healthy() with
+        {
+            OriginalColorPrimaries = "smpte170m", OutputColorPrimaries = "smpte170m",
+            OriginalColorTransfer = "smpte170m", OutputColorTransfer = "bt709",
+            OriginalColorSpace = "smpte170m", OutputColorSpace = "smpte170m",
+            OriginalColorRange = "tv", OutputColorRange = "tv"
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.Equal(CheckOutcome.Passed, Outcome(report, ColorCheck));
+        Assert.Equal("smpte170m", report.Colour?.Expected.Transfer);
+        Assert.Equal("bt709", report.Colour?.Output.Transfer);
+    }
+
+    [Fact]
+    public void A_definite_colour_range_change_fails()
+    {
+        var input = Healthy() with { OriginalColorRange = "tv", OutputColorRange = "pc" };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.Equal(CheckOutcome.Failed, Outcome(report, ColorCheck));
+        Assert.Contains("range", report.Checks.Single(check => check.Name == ColorCheck).Detail);
+    }
+
+    [Fact]
+    public void Preserved_sd_colour_does_not_hide_an_independent_vmaf_failure()
+    {
+        var input = Healthy() with
+        {
+            OriginalColorPrimaries = "smpte170m", OutputColorPrimaries = "smpte170m",
+            OriginalColorTransfer = "smpte170m", OutputColorTransfer = "smpte170m",
+            OriginalColorSpace = "smpte170m", OutputColorSpace = "smpte170m",
+            QualityScores = new QualityScores(89, 85, 70, 40, 0.95)
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, QualityGate);
+
+        Assert.Equal(CheckOutcome.Passed, Outcome(report, ColorCheck));
+        Assert.Equal(CheckOutcome.Failed, Outcome(report, QualityCheck));
+    }
+
+    [Fact]
     public void A_definite_colour_mismatch_fails()
     {
         var input = Healthy() with { OriginalColorPrimaries = "bt709", OutputColorPrimaries = "bt601" };
@@ -1122,6 +1462,9 @@ public sealed class VerificationEvaluatorTests
 
         Assert.True(report.Passed);
         Assert.Equal(CheckOutcome.Passed, Outcome(report, ColorCheck));
+        Assert.Equal("bt709", report.Colour?.Expected.Primaries);
+        Assert.Equal("tv", report.Colour?.Expected.Range);
+        Assert.True(report.Colour?.ToneMapped);
     }
 
     [Fact]
@@ -1138,6 +1481,43 @@ public sealed class VerificationEvaluatorTests
             OutputColorTransfer = "bt709",
             OriginalColorSpace = "bt2020nc",
             OutputColorSpace = "bt709"
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.Equal(CheckOutcome.Failed, Outcome(report, ColorCheck));
+    }
+
+    [Fact]
+    public void Intentional_hdr_to_sdr_rejects_full_range_output_tags()
+    {
+        var input = Healthy() with
+        {
+            OriginalIsHdr = true,
+            HdrConvertedToSdr = true,
+            OutputIsHdr = false,
+            OriginalColorPrimaries = "bt2020",
+            OutputColorPrimaries = "bt709",
+            OutputColorTransfer = "bt709",
+            OutputColorSpace = "bt709",
+            OutputColorRange = "pc"
+        };
+
+        var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);
+
+        Assert.Equal(CheckOutcome.Failed, Outcome(report, ColorCheck));
+        Assert.Contains("range is pc, expected tv", report.Checks.Single(check => check.Name == ColorCheck).Detail);
+    }
+
+    [Fact]
+    public void Intentional_hdr_to_sdr_checks_output_even_when_source_colour_tags_are_missing()
+    {
+        var input = Healthy() with
+        {
+            OriginalIsHdr = true,
+            HdrConvertedToSdr = true,
+            OutputIsHdr = false,
+            OutputColorPrimaries = "bt2020"
         };
 
         var report = VerificationEvaluator.Evaluate(input, VerificationPolicy.Default);

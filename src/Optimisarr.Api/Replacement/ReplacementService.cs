@@ -2,6 +2,7 @@ using Microsoft.EntityFrameworkCore;
 using Optimisarr.Api.Library;
 using Optimisarr.Api.Queue;
 using Optimisarr.Api.Stats;
+using Optimisarr.Core.IO;
 using Optimisarr.Core.Replacement;
 using Optimisarr.Data;
 using ReplacementEntity = Optimisarr.Data.Replacement;
@@ -14,6 +15,14 @@ public enum ReplacementResultKind
     AlreadyCompleted,
     NotFound,
     Invalid,
+
+    /// <summary>
+    /// A library rule correctly declined this replacement for now, and the same job may succeed
+    /// later — the file is hardlinked today but need not be tomorrow. Distinct from Invalid so
+    /// automatic reconciliation, which retries every few seconds, can stay quiet about an expected
+    /// decline instead of logging a warning forever.
+    /// </summary>
+    Deferred,
     Failed
 }
 
@@ -37,6 +46,9 @@ public sealed record ReplacementActionResult(
 
     public static ReplacementActionResult Invalid(string message) =>
         new(ReplacementResultKind.Invalid, message, null);
+
+    public static ReplacementActionResult Deferred(string message) =>
+        new(ReplacementResultKind.Deferred, message, null);
 
     public static ReplacementActionResult Failed(string message, bool permanent = false) =>
         new(ReplacementResultKind.Failed, message, null, permanent);
@@ -169,14 +181,21 @@ public sealed class ReplacementService
 
     public async Task<ReplacementActionResult> ReplaceAsync(int jobId, CancellationToken cancellationToken)
     {
-        // Only one replacement may act on a job at a time. A job becomes replaceable the instant it
+        // Only one replacement may act on a source at a time. A job becomes replaceable the instant it
         // reaches ReadyToReplace, where the post-verify auto-replace, the reconcile sweep, and a
         // manual replace can all target it at once; overlapping runs corrupt each other's moves and
         // destroy the verified output (the original is still safely restored). The loser of the claim
         // backs off and lets the winner finish.
-        if (!_coordinator.TryBegin(jobId))
+        var mediaFileId = await _db.Jobs.AsNoTracking().Where(job => job.Id == jobId)
+            .Select(job => (int?)job.MediaFileId).FirstOrDefaultAsync(cancellationToken);
+        if (mediaFileId is null)
         {
-            return ReplacementActionResult.Invalid($"A replacement for job {jobId} is already in progress.");
+            return ReplacementActionResult.NotFound($"No job with id {jobId}.");
+        }
+        if (!await _coordinator.TryBeginAsync(jobId, mediaFileId.Value, cancellationToken))
+        {
+            return ReplacementActionResult.Invalid(
+                $"A replacement or rollback for job {jobId} or its source is already in progress.");
         }
 
         try
@@ -185,7 +204,7 @@ public sealed class ReplacementService
         }
         finally
         {
-            _coordinator.End(jobId);
+            _coordinator.End(jobId, mediaFileId.Value);
         }
     }
 
@@ -193,6 +212,7 @@ public sealed class ReplacementService
     {
         var job = await _db.Jobs
             .Include(j => j.MediaFile)
+            .ThenInclude(f => f!.Library)
             .FirstOrDefaultAsync(j => j.Id == jobId, cancellationToken);
 
         if (job is null)
@@ -251,6 +271,31 @@ public sealed class ReplacementService
         {
             return ReplacementActionResult.Failed(
                 $"The original file no longer exists: {media.Path}", permanent: true);
+        }
+
+        // The link count recorded at scan time decided whether to *encode* this file. Whether to
+        // *replace* it is a different question asked at a different moment, and a download client
+        // can hardlink a file at any point in between. Re-read it live, against the file that is
+        // about to be moved into quarantine, rather than trusting a number that may be hours old.
+        if (media.Library is { ExcludeHardLinkedFiles: true })
+        {
+            var links = HardLinkProbe.CountLinks(media.Path);
+            if (links is null)
+            {
+                return ReplacementActionResult.Deferred(
+                    $"This library excludes hardlinked files, and the link count for {media.Path} could not be "
+                    + "read, so the original was left untouched.");
+            }
+
+            if (links > 1)
+            {
+                // Deliberately not permanent. The encoded output stays verified and ready, and the
+                // job can replace normally once the other link is gone — a file that stops being
+                // seeded should not need re-encoding from scratch.
+                return ReplacementActionResult.Deferred(
+                    $"{media.Path} now has {links} names pointing at it, and this library excludes hardlinked "
+                    + "files. Replacing it would change the other copies, so the original was left untouched.");
+            }
         }
 
         var plan = ReplacementPlanner.Plan(
@@ -444,7 +489,7 @@ public sealed class ReplacementService
             return ReplacementActionResult.NotFound($"No replacement with id {replacementId}.");
         }
 
-        if (!_coordinator.TryBegin(replacement.JobId))
+        if (!await _coordinator.TryBeginAsync(replacement.JobId, replacement.MediaFileId, cancellationToken))
         {
             return ReplacementActionResult.Invalid(
                 $"A replacement or rollback for job {replacement.JobId} is already in progress.");
@@ -456,7 +501,7 @@ public sealed class ReplacementService
         }
         finally
         {
-            _coordinator.End(replacement.JobId);
+            _coordinator.End(replacement.JobId, replacement.MediaFileId);
         }
     }
 

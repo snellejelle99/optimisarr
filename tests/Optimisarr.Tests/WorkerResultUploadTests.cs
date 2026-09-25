@@ -1,0 +1,689 @@
+using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json;
+using Microsoft.AspNetCore.Http.Metadata;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.DependencyInjection;
+using Optimisarr.Api.Queue;
+using Optimisarr.Api.Library;
+using Optimisarr.Api.Workers;
+using Optimisarr.Core.Domain;
+using Optimisarr.Core.Workers;
+using Optimisarr.Data;
+
+namespace Optimisarr.Tests;
+
+/// <summary>
+/// Accepting a file produced on someone else's machine is the point in this feature where media can
+/// actually be lost, so these tests lead with the ways it goes wrong rather than the happy path: a
+/// candidate encoded from a different source, a result arriving after the claim lapsed, a truncated
+/// upload, and a second result for one lease.
+///
+/// Nothing here may touch an original. A returned candidate lands in the work directory exactly as
+/// a local transcode's output does, and goes no further until verification has run.
+/// </summary>
+[Collection(TokenedApiCollection.Name)]
+public sealed class WorkerResultUploadTests : IAsyncLifetime
+{
+    private readonly AdminTokenAuthEndpointTests.TokenedApi _api;
+    private readonly List<int> _createdLibraries = [];
+
+    private static readonly byte[] SourceBytes =
+        Enumerable.Range(0, 4096).Select(i => (byte)(i % 251)).ToArray();
+
+    private static readonly byte[] CandidateBytes =
+        Enumerable.Range(0, 2048).Select(i => (byte)(i % 199)).ToArray();
+
+    public WorkerResultUploadTests(AdminTokenAuthEndpointTests.TokenedApi api) => _api = api;
+
+    public Task InitializeAsync() => Task.CompletedTask;
+
+    public async Task DisposeAsync()
+    {
+        if (_createdLibraries.Count == 0) return;
+        using var scope = _api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        var jobIds = await db.Jobs
+            .Where(job => job.LibraryId != null && _createdLibraries.Contains(job.LibraryId.Value))
+            .Select(job => job.Id).ToListAsync();
+        db.JobLeases.RemoveRange(db.JobLeases.Where(l => jobIds.Contains(l.JobId)));
+        await db.SaveChangesAsync();
+        db.Libraries.RemoveRange(db.Libraries.Where(l => _createdLibraries.Contains(l.Id)));
+        await db.SaveChangesAsync();
+    }
+
+    private static string Sha256(byte[] bytes) =>
+        Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant();
+
+    private HttpClient Admin()
+    {
+        var client = _api.CreateClient();
+        client.DefaultRequestHeaders.Authorization =
+            new AuthenticationHeaderValue("Bearer", AdminTokenAuthEndpointTests.TokenedApi.Token);
+        return client;
+    }
+
+    private async Task EnableRemoteWorkers(bool? strictVerification = false)
+    {
+        var admin = Admin();
+        var current = await (await admin.GetAsync("/api/settings")).Content.ReadFromJsonAsync<JsonElement>();
+        using var doc = JsonDocument.Parse(current.GetRawText());
+        var payload = new Dictionary<string, object?>();
+        foreach (var p in doc.RootElement.EnumerateObject())
+            payload[p.Name] = JsonSerializer.Deserialize<object?>(p.Value.GetRawText());
+        payload["remoteWorkersEnabled"] = true;
+        if (strictVerification is not null)
+            payload["workerVerificationRequired"] = strictVerification;
+        (await admin.PutAsJsonAsync("/api/settings", payload)).EnsureSuccessStatusCode();
+    }
+
+    private async Task<HttpClient> PairWorker(string name, int protocolMaximum = 1)
+    {
+        var admin = Admin();
+        var pin = (await (await admin.PostAsync("/api/workers/pairing-code", null))
+            .Content.ReadFromJsonAsync<JsonElement>()).GetProperty("code").GetString()!;
+        var paired = await _api.CreateClient().PostAsJsonAsync("/api/workers/pair", new
+        {
+            code = pin, name, operatingSystem = "linux", architecture = "x64",
+            protocolMinimum = 1, protocolMaximum,
+            videoEncoders = new[] { "libx265" }, audioEncoders = new[] { "aac" },
+            hardwareDecoders = Array.Empty<string>(),
+            vmaf = "Cpu", freeScratchBytes = 500L * 1024 * 1024 * 1024, maxConcurrency = 1,
+        });
+        paired.EnsureSuccessStatusCode();
+        var credential = (await paired.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("credential").GetString()!;
+        var client = _api.CreateClient();
+        client.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", credential);
+        return client;
+    }
+
+    private async Task QueueAJob()
+    {
+        using var scope = _api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        var library = new Library { Name = "Results", Path = Path.Combine(_api.LibraryDirectory, Guid.NewGuid().ToString("N")) };
+        db.Libraries.Add(library);
+        await db.SaveChangesAsync();
+        _createdLibraries.Add(library.Id);
+
+        Directory.CreateDirectory(library.Path);
+        var sourcePath = Path.Combine(library.Path, "film.mkv");
+        await File.WriteAllBytesAsync(sourcePath, SourceBytes);
+
+        var file = new MediaFile
+        {
+            LibraryId = library.Id, Path = sourcePath, RelativePath = "film.mkv",
+            SizeBytes = SourceBytes.Length,
+        };
+        db.MediaFiles.Add(file);
+        await db.SaveChangesAsync();
+
+        db.Jobs.Add(new Job
+        {
+            MediaFileId = file.Id, LibraryId = library.Id,
+            Status = JobStatus.Queued, Type = JobType.Normal, VideoEncoder = "libx265",
+        });
+        await db.SaveChangesAsync();
+    }
+
+    [Fact]
+    public async Task Strict_mode_issues_a_contract_and_frozen_work_only_to_protocol_two_workers()
+    {
+        await EnableRemoteWorkers(strictVerification: true);
+        try
+        {
+            var worker = await PairWorker("Strict verifier", protocolMaximum: 2);
+            await QueueAJob();
+
+            var assignment = await (await worker.PostAsJsonAsync("/api/workers/claim", new { }))
+                .Content.ReadFromJsonAsync<JsonElement>();
+            Assert.NotEqual(JsonValueKind.Null, assignment.ValueKind);
+            Assert.True(assignment.TryGetProperty("fullVerification", out var contract));
+            Assert.Equal(1, contract.GetProperty("version").GetInt32());
+            Assert.True(contract.GetProperty("id").GetGuid() != Guid.Empty);
+
+            using var scope = _api.Services.CreateScope();
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            var leaseId = assignment.GetProperty("leaseId").GetGuid();
+            var lease = await db.JobLeases.FindAsync(leaseId);
+            Assert.NotNull(lease);
+            Assert.NotNull(lease!.VerificationContractJson);
+            Assert.NotNull(lease.VerificationWorkJson);
+            using var frozen = JsonDocument.Parse(lease.VerificationWorkJson);
+            Assert.False(frozen.RootElement.GetProperty("original").GetProperty("hdrConvertedToSdr").GetBoolean());
+        }
+        finally
+        {
+            await EnableRemoteWorkers();
+        }
+    }
+
+    [Fact]
+    public async Task Fresh_settings_assign_complete_verification_without_operator_toggle()
+    {
+        using (var scope = _api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            var saved = await db.AppSettings.FindAsync(SettingKeys.WorkerVerificationRequired);
+            if (saved is not null)
+            {
+                db.AppSettings.Remove(saved);
+                await db.SaveChangesAsync();
+            }
+            var settings = new SettingsStore(db);
+            await settings.InitialiseSetupStateAsync(
+                databaseExistedBeforeStartup: false, CancellationToken.None);
+            Assert.True((await settings.GetQueueSettingsAsync(CancellationToken.None)).WorkerVerificationRequired);
+        }
+        await EnableRemoteWorkers(strictVerification: null);
+        try
+        {
+            var worker = await PairWorker("Default complete verifier", protocolMaximum: 2);
+            await QueueAJob();
+            var assignment = await (await worker.PostAsJsonAsync("/api/workers/claim", new { }))
+                .Content.ReadFromJsonAsync<JsonElement>();
+            Assert.NotEqual(JsonValueKind.Null, assignment.ValueKind);
+            Assert.True(assignment.TryGetProperty("fullVerification", out _));
+        }
+        finally
+        {
+            await EnableRemoteWorkers();
+        }
+    }
+
+    [Fact]
+    public async Task Legacy_worker_assignment_freezes_its_actual_colour_contract()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Legacy colour verifier");
+        await QueueAJob();
+
+        var assignment = await (await worker.PostAsJsonAsync("/api/workers/claim", new { }))
+            .Content.ReadFromJsonAsync<JsonElement>();
+        Assert.NotEqual(JsonValueKind.Null, assignment.ValueKind);
+
+        using var scope = _api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        var lease = await db.JobLeases.FindAsync(assignment.GetProperty("leaseId").GetGuid());
+        Assert.NotNull(lease);
+        Assert.Null(lease.VerificationContractJson);
+        Assert.NotNull(lease.VerificationWorkJson);
+        using var frozen = JsonDocument.Parse(lease.VerificationWorkJson);
+        Assert.Equal(
+            frozen.RootElement.GetProperty("spec").GetProperty("tonemapToSdr").GetBoolean(),
+            frozen.RootElement.GetProperty("original").GetProperty("hdrConvertedToSdr").GetBoolean());
+        Assert.False(frozen.RootElement.GetProperty("original").GetProperty("hdrConvertedToSdr").GetBoolean());
+    }
+
+    [Fact]
+    public async Task A_delivered_candidate_keeps_its_worker_plan_after_library_settings_change()
+    {
+        await EnableRemoteWorkers();
+        var encoder = await PairWorker("Colour assignment owner");
+        await PairWorker("Other available worker");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(encoder);
+
+        string originalPlan;
+        using (var scope = _api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            var lease = await db.JobLeases.FindAsync(Guid.Parse(leaseId));
+            originalPlan = Assert.IsType<string>(lease!.VerificationWorkJson);
+            var library = await db.Libraries.FindAsync(_createdLibraries[^1]);
+            library!.HdrHandling = HdrHandling.TonemapToSdr;
+            await db.SaveChangesAsync();
+        }
+
+        (await encoder.SendAsync(Upload(leaseId, CandidateBytes, sourceHash))).EnsureSuccessStatusCode();
+
+        using var read = _api.Services.CreateScope();
+        var readDb = read.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        var delivered = await readDb.JobLeases.FindAsync(Guid.Parse(leaseId));
+        Assert.Equal(originalPlan, delivered!.VerificationWorkJson);
+        Assert.Equal("Colour assignment owner",
+            (await QueueDispatcher.DeliveringWorkerAsync(readDb, delivered.JobId, CancellationToken.None))?.Name);
+    }
+
+    [Fact]
+    public async Task A_worker_claim_starts_a_fresh_attempt_without_an_older_verdict()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("PICARD claim reset");
+        await QueueAJob();
+        int jobId;
+        using (var scope = _api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            var job = await db.Jobs.OrderByDescending(item => item.Id).FirstAsync();
+            jobId = job.Id;
+            job.VerificationPassed = false;
+            job.VerificationReportJson = "{\"checks\":[]}";
+            job.VerifiedAt = DateTimeOffset.UtcNow;
+            job.OutputSizeBytes = 1234;
+            job.VideoEncoder = "hevc_videotoolbox";
+            job.Progress = 0.8;
+            job.ErrorMessage = "previous failure";
+            await db.SaveChangesAsync();
+        }
+
+        var assignment = await (await worker.PostAsJsonAsync("/api/workers/claim", new { }))
+            .Content.ReadFromJsonAsync<JsonElement>();
+        Assert.NotEqual(JsonValueKind.Null, assignment.ValueKind);
+        using var readScope = _api.Services.CreateScope();
+        var readDb = readScope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        var claimed = await readDb.Jobs.FindAsync(jobId);
+        Assert.NotNull(claimed);
+        Assert.Equal(JobStatus.Leased, claimed.Status);
+        Assert.Equal(1, claimed.ExecutionAttempt);
+        Assert.Equal("libx265", claimed.VideoEncoder);
+        Assert.Null(claimed.VerificationPassed);
+        Assert.Null(claimed.VerificationReportJson);
+        Assert.Null(claimed.VerifiedAt);
+        Assert.Null(claimed.OutputSizeBytes);
+        Assert.Equal(0, claimed.Progress);
+        Assert.Null(claimed.ErrorMessage);
+    }
+
+    [Fact]
+    public async Task Full_verification_evidence_is_lease_bound_authenticated_and_immutable()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Full verification evidence");
+        var other = await PairWorker("Different verifier");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+        var contract = new RemoteVerificationContract(1, Guid.NewGuid(), false);
+        using (var scope = _api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            var lease = await db.JobLeases.FindAsync(Guid.Parse(leaseId));
+            lease!.VerificationContractJson = JsonSerializer.Serialize(contract, new JsonSerializerOptions(JsonSerializerDefaults.Web));
+            await db.SaveChangesAsync();
+        }
+        var endpoint = $"/api/workers/leases/{leaseId}/verification";
+        var evidence = new RemoteVerificationEvidence(contract.Id, sourceHash, Sha256(CandidateBytes),
+            Error: "A required decoder is unavailable.");
+        Assert.Equal(HttpStatusCode.Forbidden, (await other.PostAsJsonAsync(endpoint, evidence)).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, (await worker.PostAsJsonAsync(endpoint,
+            evidence with { ContractId = Guid.NewGuid() })).StatusCode);
+        Assert.Equal(HttpStatusCode.Conflict, (await worker.PostAsJsonAsync(endpoint,
+            evidence with { SourceSha256 = new string('f', 64) })).StatusCode);
+        (await worker.PostAsJsonAsync(endpoint, evidence)).EnsureSuccessStatusCode();
+        (await worker.PostAsJsonAsync(endpoint, evidence)).EnsureSuccessStatusCode();
+        Assert.Equal(HttpStatusCode.Conflict, (await worker.PostAsJsonAsync(endpoint,
+            evidence with { Error = null })).StatusCode);
+        (await worker.SendAsync(Upload(leaseId, CandidateBytes, sourceHash))).EnsureSuccessStatusCode();
+        Assert.Equal(HttpStatusCode.Conflict, (await worker.PostAsJsonAsync(endpoint, evidence)).StatusCode);
+        using var read = _api.Services.CreateScope();
+        var recorded = await read.ServiceProvider.GetRequiredService<OptimisarrDbContext>().JobLeases.FindAsync(Guid.Parse(leaseId));
+        Assert.Contains("decoder is unavailable", recorded!.VerificationEvidenceJson);
+    }
+
+    [Fact]
+    public async Task Concurrent_verification_reports_cannot_replace_the_first_recorded_evidence()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Concurrent verification");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+        var contract = new RemoteVerificationContract(1, Guid.NewGuid(), false);
+        var options = new JsonSerializerOptions(JsonSerializerDefaults.Web);
+        using (var scope = _api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            var lease = await db.JobLeases.FindAsync(Guid.Parse(leaseId));
+            lease!.VerificationContractJson = JsonSerializer.Serialize(contract, options);
+            await db.SaveChangesAsync();
+        }
+        var endpoint = $"/api/workers/leases/{leaseId}/verification";
+        var reports = Enumerable.Range(0, 8).Select(index => new RemoteVerificationEvidence(
+            contract.Id, sourceHash, Sha256(CandidateBytes), Error: $"Measurement failure {index}")).ToArray();
+        var responses = await Task.WhenAll(reports.Select(report => worker.PostAsJsonAsync(endpoint, report)));
+        Assert.Single(responses, response => response.IsSuccessStatusCode);
+        Assert.Equal(7, responses.Count(response => response.StatusCode == HttpStatusCode.Conflict));
+        var winner = Array.FindIndex(responses, response => response.IsSuccessStatusCode);
+        using var read = _api.Services.CreateScope();
+        var recorded = await read.ServiceProvider.GetRequiredService<OptimisarrDbContext>()
+            .JobLeases.FindAsync(Guid.Parse(leaseId));
+        Assert.Equal(JsonSerializer.Serialize(reports[winner], options), recorded!.VerificationEvidenceJson);
+        (await worker.PostAsJsonAsync(endpoint, reports[winner])).EnsureSuccessStatusCode();
+    }
+
+    [Fact]
+    public async Task Releasing_a_cancelled_job_frees_the_lease_without_requeueing_the_job()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Cancelled release");
+        await QueueAJob();
+        var (leaseId, _) = await ClaimAndFetch(worker);
+        int jobId;
+        using (var scope = _api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            jobId = await db.JobLeases.Where(lease => lease.Id == Guid.Parse(leaseId))
+                .Select(lease => lease.JobId).SingleAsync();
+        }
+        (await Admin().PostAsync($"/api/jobs/{jobId}/cancel", null)).EnsureSuccessStatusCode();
+        (await worker.PostAsync($"/api/workers/leases/{leaseId}/release", null)).EnsureSuccessStatusCode();
+        using var read = _api.Services.CreateScope();
+        var readDb = read.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        Assert.Equal(JobStatus.Cancelled, (await readDb.Jobs.FindAsync(jobId))!.Status);
+        Assert.Equal(LeaseState.Released, (await readDb.JobLeases.FindAsync(Guid.Parse(leaseId)))!.State);
+    }
+
+    /// <summary>Claims a job and fetches its source, which is what records the source hash.</summary>
+    private async Task<(string LeaseId, string SourceHash)> ClaimAndFetch(HttpClient worker)
+    {
+        var assignment = await (await worker.PostAsJsonAsync("/api/workers/claim", new { }))
+            .Content.ReadFromJsonAsync<JsonElement>();
+        var leaseId = assignment.GetProperty("leaseId").GetString()!;
+
+        using var source = await worker.GetAsync($"/api/workers/leases/{leaseId}/source");
+        source.EnsureSuccessStatusCode();
+        var hash = source.Headers.GetValues("X-Optimisarr-Source-Sha256").Single();
+        return (leaseId, hash);
+    }
+
+    private static HttpRequestMessage Upload(string leaseId, byte[] body, string sourceHash, string? candidateHash = null)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, $"/api/workers/leases/{leaseId}/result")
+        {
+            Content = new ByteArrayContent(body),
+        };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        request.Headers.Add("X-Optimisarr-Source-Sha256", sourceHash);
+        request.Headers.Add("X-Optimisarr-Candidate-Sha256", candidateHash ?? Sha256(body));
+        return request;
+    }
+
+    [Fact]
+    public async Task A_candidate_encoded_from_a_different_source_is_refused()
+    {
+        // The case the source hash exists for. A worker that fetched one file and returns a
+        // candidate claiming a different origin has produced something that is not evidence about
+        // this job at all, whatever its quality.
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Wrong source");
+        await QueueAJob();
+        var (leaseId, _) = await ClaimAndFetch(worker);
+
+        var wrongSource = Sha256(Encoding.UTF8.GetBytes("a completely different original"));
+        using var response = await worker.SendAsync(Upload(leaseId, CandidateBytes, wrongSource));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+
+        // And the operator can read what happened on the worker's card, because the worker only
+        // ever sees a 409.
+        using var listed = await Admin().GetAsync("/api/workers");
+        var row = (await listed.Content.ReadFromJsonAsync<JsonElement>())
+            .EnumerateArray().Single(w => w.GetProperty("name").GetString() == "Wrong source" && w.GetProperty("revokedAt").ValueKind == JsonValueKind.Null);
+        Assert.Contains("different source", row.GetProperty("lastProblem").GetString());
+    }
+
+    [Fact]
+    public async Task A_truncated_upload_is_refused_rather_than_stored()
+    {
+        // A transfer that dies part-way leaves a shorter file whose hash cannot match. Accepting it
+        // would mean verifying a partial encode and potentially replacing an original with it.
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Truncated");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        var truncated = CandidateBytes.Take(500).ToArray();
+        // Claims the hash of the whole file while sending only part of it.
+        using var response = await worker.SendAsync(
+            Upload(leaseId, truncated, sourceHash, candidateHash: Sha256(CandidateBytes)));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_result_arriving_after_the_claim_lapsed_is_refused()
+    {
+        // The late-result case: the worker went away, the job moved on, and it comes back with a
+        // candidate. It must not be accepted through a claim it no longer holds.
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Late");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        (await worker.PostAsJsonAsync($"/api/workers/leases/{leaseId}/release", new { }))
+            .EnsureSuccessStatusCode();
+
+        using var response = await worker.SendAsync(Upload(leaseId, CandidateBytes, sourceHash));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_worker_cannot_deliver_a_result_for_someone_elses_lease()
+    {
+        await EnableRemoteWorkers();
+        var holder = await PairWorker("Result holder");
+        var intruder = await PairWorker("Result intruder");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(holder);
+
+        using var stolen = await intruder.SendAsync(Upload(leaseId, CandidateBytes, sourceHash));
+        Assert.Equal(HttpStatusCode.Forbidden, stolen.StatusCode);
+
+        using var anonymous = await _api.CreateClient()
+            .SendAsync(Upload(leaseId, CandidateBytes, sourceHash));
+        Assert.Equal(HttpStatusCode.Unauthorized, anonymous.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_second_result_for_one_lease_is_refused()
+    {
+        // Duplicate delivery, which the roadmap calls out explicitly. The first result completes
+        // the lease, so the second has no live claim to arrive through.
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Duplicate");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        using var first = await worker.SendAsync(Upload(leaseId, CandidateBytes, sourceHash));
+        Assert.Equal(HttpStatusCode.Accepted, first.StatusCode);
+
+        using var second = await worker.SendAsync(Upload(leaseId, CandidateBytes, sourceHash));
+        Assert.Equal(HttpStatusCode.Conflict, second.StatusCode);
+    }
+
+    [Fact]
+    public void The_delivery_route_lifts_kestrels_default_body_cap()
+    {
+        // A candidate is a whole film. The in-process test host does not enforce Kestrel's 30 MB
+        // default, so the first real delivery from a Mac was the first to hit it; this pins the
+        // route metadata Kestrel reads, so the cap cannot quietly return.
+        var deliver = Assert.Single(
+            _api.Services.GetRequiredService<EndpointDataSource>().Endpoints,
+            endpoint => endpoint.Metadata.GetMetadata<IEndpointNameMetadata>()?.EndpointName == "DeliverResult");
+
+        var limit = deliver.Metadata.GetMetadata<IRequestSizeLimitMetadata>();
+        Assert.NotNull(limit);
+        Assert.Null(limit.MaxRequestBodySize);
+    }
+
+    [Fact]
+    public async Task An_accepted_candidate_lands_in_the_work_directory_and_never_over_the_original()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Accepted");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        using var response = await worker.SendAsync(Upload(leaseId, CandidateBytes, sourceHash));
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+
+        using var scope = _api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        var job = await db.Jobs.Include(j => j.MediaFile)
+            .FirstAsync(j => j.LibraryId != null && _createdLibraries.Contains(j.LibraryId.Value));
+
+        Assert.NotNull(job.WorkOutputPath);
+        Assert.True(File.Exists(job.WorkOutputPath));
+        Assert.Equal(CandidateBytes, await File.ReadAllBytesAsync(job.WorkOutputPath!));
+
+        // Waiting, not Verifying: the dispatcher picks it up in its turn, and restart recovery
+        // leaves it alone rather than treating it as an interrupted local encode.
+        Assert.Equal(JobStatus.AwaitingVerification, job.Status);
+        Assert.True(RemoteCandidate.IsDelivered(job.WorkOutputPath));
+        // Named by the contract's container, not the source's: this library targets MP4 while the
+        // source is an MKV, and the replacement takes the final extension from this name. The
+        // first live delivery landed as remote-1.mkv holding an MP4, which is how this was found.
+        Assert.Equal(".mp4", Path.GetExtension(job.WorkOutputPath));
+
+        // Verification rebuilds the contract for the worker that delivered, found through its
+        // completed lease. Asked here, against SQLite, because the first live delivery failed on
+        // exactly this lookup: the database cannot order a DateTimeOffset.
+        var deliveredBy = await QueueDispatcher.DeliveringWorkerAsync(db, job.Id, CancellationToken.None);
+        Assert.Equal("Accepted", deliveredBy?.Name);
+
+        // The original must be exactly as it was. A returned candidate is a proposal, not a
+        // replacement, and nothing about delivering one may touch the source.
+        Assert.Equal(SourceBytes, await File.ReadAllBytesAsync(job.MediaFile!.Path));
+    }
+
+    private static HttpRequestMessage Chunk(string leaseId, byte[] body, long offset)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Patch, $"/api/workers/leases/{leaseId}/result")
+        {
+            Content = new ByteArrayContent(body),
+        };
+        request.Content.Headers.ContentType = new MediaTypeHeaderValue("application/octet-stream");
+        request.Headers.Add("X-Optimisarr-Offset", offset.ToString());
+        return request;
+    }
+
+    private static HttpRequestMessage Complete(string leaseId, string sourceHash, string candidateHash)
+    {
+        var request = new HttpRequestMessage(HttpMethod.Post, $"/api/workers/leases/{leaseId}/result/complete");
+        request.Headers.Add("X-Optimisarr-Source-Sha256", sourceHash);
+        request.Headers.Add("X-Optimisarr-Candidate-Sha256", candidateHash);
+        return request;
+    }
+
+    [Fact]
+    public async Task A_candidate_can_arrive_in_chunks_and_is_judged_exactly_as_a_whole_upload()
+    {
+        // The resumable form of delivery. Three chunks at the offsets the server confirms, then a
+        // completion carrying both hashes; the assembled file is hashed and accepted the same way.
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Chunked");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        using var offset0 = await worker.GetAsync($"/api/workers/leases/{leaseId}/result/offset");
+        Assert.Equal(0, (await offset0.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("bytes").GetInt64());
+
+        var parts = new[] { CandidateBytes[..5], CandidateBytes[5..9], CandidateBytes[9..] };
+        long sent = 0;
+        foreach (var part in parts)
+        {
+            using var appended = await worker.SendAsync(Chunk(leaseId, part, sent));
+            Assert.Equal(HttpStatusCode.OK, appended.StatusCode);
+            sent += part.Length;
+            Assert.Equal(sent, (await appended.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("bytes").GetInt64());
+        }
+
+        using var completed = await worker.SendAsync(Complete(leaseId, sourceHash, Sha256(CandidateBytes)));
+        Assert.Equal(HttpStatusCode.Accepted, completed.StatusCode);
+
+        using var scope = _api.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+        var job = await db.Jobs.FirstAsync(j => j.LibraryId != null && _createdLibraries.Contains(j.LibraryId.Value));
+        Assert.Equal(JobStatus.AwaitingVerification, job.Status);
+        Assert.Equal(CandidateBytes, await File.ReadAllBytesAsync(job.WorkOutputPath!));
+        Assert.Empty(Directory.GetFiles(Path.GetDirectoryName(job.WorkOutputPath!)!, "*.partial"));
+    }
+
+    [Fact]
+    public async Task A_chunk_at_the_wrong_offset_is_refused_with_the_real_one_so_the_worker_can_resume()
+    {
+        // The case a dropped connection produces: the worker believes a chunk landed that did
+        // not, or repeats one that did. The server names the truth and the worker carries on.
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Resumer");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        (await worker.SendAsync(Chunk(leaseId, CandidateBytes[..5], 0))).EnsureSuccessStatusCode();
+
+        using var repeated = await worker.SendAsync(Chunk(leaseId, CandidateBytes[..5], 0));
+        Assert.Equal(HttpStatusCode.Conflict, repeated.StatusCode);
+        var body = await repeated.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("worker.result.offsetMismatch", body.GetProperty("code").GetString());
+
+        using var offset = await worker.GetAsync($"/api/workers/leases/{leaseId}/result/offset");
+        Assert.Equal(5, (await offset.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("bytes").GetInt64());
+
+        (await worker.SendAsync(Chunk(leaseId, CandidateBytes[5..], 5))).EnsureSuccessStatusCode();
+        using var completed = await worker.SendAsync(Complete(leaseId, sourceHash, Sha256(CandidateBytes)));
+        Assert.Equal(HttpStatusCode.Accepted, completed.StatusCode);
+    }
+
+    [Fact]
+    public async Task Completing_an_upload_whose_bytes_do_not_match_the_declared_hash_is_refused_and_leaves_nothing()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Chunked mismatch");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+        (await worker.SendAsync(Chunk(leaseId, CandidateBytes[..5], 0))).EnsureSuccessStatusCode();
+
+        using var completed = await worker.SendAsync(Complete(leaseId, sourceHash, Sha256(CandidateBytes)));
+
+        Assert.Equal(HttpStatusCode.Conflict, completed.StatusCode);
+        using var offset = await worker.GetAsync($"/api/workers/leases/{leaseId}/result/offset");
+        Assert.Equal(0, (await offset.Content.ReadFromJsonAsync<JsonElement>()).GetProperty("bytes").GetInt64());
+    }
+
+    [Fact]
+    public async Task Completing_with_nothing_staged_is_refused()
+    {
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Empty");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        using var completed = await worker.SendAsync(Complete(leaseId, sourceHash, Sha256(CandidateBytes)));
+
+        Assert.Equal(HttpStatusCode.Conflict, completed.StatusCode);
+    }
+
+    [Fact]
+    public async Task A_candidate_for_a_job_the_operator_cancelled_is_refused()
+    {
+        // The lease is still live, but the job is not: someone chose to stop it while the worker
+        // was encoding. Accepting the candidate would quietly revive that work.
+        await EnableRemoteWorkers();
+        var worker = await PairWorker("Late");
+        await QueueAJob();
+        var (leaseId, sourceHash) = await ClaimAndFetch(worker);
+
+        int jobId;
+        using (var scope = _api.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<OptimisarrDbContext>();
+            var job = await db.Jobs.FirstAsync(j => j.LibraryId != null && _createdLibraries.Contains(j.LibraryId.Value));
+            job.Status = JobStatus.Cancelled;
+            await db.SaveChangesAsync();
+            jobId = job.Id;
+        }
+
+        using var response = await worker.SendAsync(Upload(leaseId, CandidateBytes, sourceHash));
+
+        Assert.Equal(HttpStatusCode.Conflict, response.StatusCode);
+        using var check = _api.Services.CreateScope();
+        var after = await check.ServiceProvider.GetRequiredService<OptimisarrDbContext>().Jobs.FindAsync(jobId);
+        Assert.Equal(JobStatus.Cancelled, after!.Status);
+        Assert.Null(after.WorkOutputPath);
+    }
+}

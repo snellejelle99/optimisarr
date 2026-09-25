@@ -3,12 +3,17 @@ namespace Optimisarr.Data;
 /// <summary>Well-known keys for rows in the <see cref="AppSetting"/> table.</summary>
 public static class SettingKeys
 {
+    public const string WorkerVerificationRequired = "workers.verificationRequired";
+
     public const string SetupState = "setup.state";
     /// <summary>Absolute path to the single configured media library root.</summary>
     public const string LibraryRoot = "library.root";
 
     /// <summary>Maximum number of transcode jobs allowed to run at once across all libraries.</summary>
     public const string MaxConcurrentJobs = "queue.maxConcurrentJobs";
+    public const string WorkloadConcurrencyMode = "queue.workloadConcurrencyMode";
+    public const string NonVideoSlots = "queue.nonVideoSlots";
+    public const string EvidenceValidationSlots = "queue.evidenceValidationSlots";
 
     /// <summary>Minimum free bytes on the work filesystem before new jobs may start.</summary>
     public const string MinFreeDiskBytes = "queue.minFreeDiskBytes";
@@ -82,6 +87,13 @@ public static class SettingKeys
 
     /// <summary>Whether replacement and quarantine purge actions are blocked while optimisation can still be tested.</summary>
     public const string DryRunMode = "replacement.dryRunMode";
+
+    /// <summary>
+    /// Whether optional remote transcoding sidecars may be paired and given work. Off by default:
+    /// one container stays the complete, uncomplicated way to run Optimisarr, and distributed
+    /// transcoding is something an operator opts into deliberately.
+    /// </summary>
+    public const string RemoteWorkersEnabled = "workers.remoteEnabled";
 
     /// <summary>
     /// How many days quarantined originals and failed work outputs should be retained; 0 means

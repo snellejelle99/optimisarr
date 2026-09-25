@@ -18,6 +18,9 @@ public sealed class LibraryRequestParserTests
         Priority: 0,
         MinFileSizeBytes: null,
         MaxHeight: null,
+        VideoDownscaleHeight: null,
+        MaxFrameRate: null,
+        CropBlackBars: null,
         ReencodeSameCodecAboveBytes: null,
         SkipEfficientSources: null,
         TargetVideoCodec: null,
@@ -25,6 +28,12 @@ public sealed class LibraryRequestParserTests
         HdrHandling: null,
         OptimiseDolbyVision: null,
         ExcludePaths: null,
+        ExcludeHardLinkedFiles: null,
+        SkipSourceCodecs: null,
+        ContentTune: null,
+        MaxBitrateKbps: null,
+        MinBitrateKbps: null,
+        StrongerAdaptiveQuantisation: null,
         QualityCrf: null,
         EncoderPreset: encoderPreset,
         AudioTargetCodec: null,
@@ -54,6 +63,205 @@ public sealed class LibraryRequestParserTests
         AutoEnqueueWindowEnd: null,
         AutoReplace: null,
         VideoQualityStrategy: null);
+
+    [Theory]
+    [InlineData("5")]
+    [InlineData("999")]
+    [InlineData("-1")]
+    public void A_numeric_content_tune_is_refused_rather_than_becoming_an_undefined_value(string tune)
+    {
+        // Enum.TryParse accepts a number for any enum and hands back whatever integer it was given,
+        // defined or not. Left unchecked, "999" would store a ContentTune that is not a member —
+        // and the tuning policy, asking only "is this Animation?", would silently encode it as
+        // grain. The contract is names, so only names are accepted.
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { ContentTune = tune }, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Contains("content tune", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Theory]
+    [InlineData("Animation", Optimisarr.Core.Queue.ContentTune.Animation)]
+    [InlineData("animation", Optimisarr.Core.Queue.ContentTune.Animation)]
+    [InlineData("Grain", Optimisarr.Core.Queue.ContentTune.Grain)]
+    [InlineData("None", Optimisarr.Core.Queue.ContentTune.None)]
+    public void A_named_content_tune_is_accepted_whatever_its_casing(
+        string tune, Optimisarr.Core.Queue.ContentTune expected)
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { ContentTune = tune }, out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(expected, parsed.ContentTune);
+    }
+
+    [Fact]
+    public void An_omitted_work_placement_means_anywhere()
+    {
+        // A client that predates the choice must keep placing work exactly as it did.
+        var ok = LibraryRequestParser.TryParse(Request(), out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(Optimisarr.Core.Queue.WorkPlacement.Anywhere, parsed.WorkPlacement);
+    }
+
+    [Theory]
+    [InlineData("WorkerOnly", Optimisarr.Core.Queue.WorkPlacement.WorkerOnly)]
+    [InlineData("preferworker", Optimisarr.Core.Queue.WorkPlacement.PreferWorker)]
+    [InlineData("LocalOnly", Optimisarr.Core.Queue.WorkPlacement.LocalOnly)]
+    public void A_named_work_placement_is_accepted_whatever_its_casing(
+        string placement, Optimisarr.Core.Queue.WorkPlacement expected)
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { WorkPlacement = placement }, out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(expected, parsed.WorkPlacement);
+    }
+
+    [Theory]
+    [InlineData("7")]
+    [InlineData("Cloud")]
+    public void An_unknown_work_placement_is_refused(string placement)
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { WorkPlacement = placement }, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Contains("work placement", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void A_bitrate_floor_above_the_cap_is_refused()
+    {
+        // An inverted window is impossible to honour. Refused at the boundary so an operator sees
+        // the mistake, rather than stored and then silently dropped at encode time.
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MaxBitrateKbps = 4000, MinBitrateKbps = 6000 }, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Contains("cannot be above", error);
+    }
+
+    [Fact]
+    public void A_bitrate_floor_without_a_cap_is_refused()
+    {
+        // A floor is a VBV constraint. Without the ceiling that defines the window there is nothing
+        // for it to mean, and x264/x265 would ignore it — a setting that looks applied and is not.
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MinBitrateKbps = 2000 }, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Contains("needs a maximum", error);
+    }
+
+    [Fact]
+    public void A_bitrate_floor_inside_the_window_is_accepted()
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MaxBitrateKbps = 8000, MinBitrateKbps = 2000 }, out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(2000, parsed.MinBitrateKbps);
+        Assert.Equal(8000, parsed.MaxBitrateKbps);
+    }
+
+    [Fact]
+    public void A_bitrate_floor_equal_to_the_cap_is_accepted_as_a_fixed_rate()
+    {
+        // min == max is the conventional way to ask for constant bitrate; it is a valid window.
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MaxBitrateKbps = 5000, MinBitrateKbps = 5000 }, out _, out var error);
+
+        Assert.True(ok, error);
+    }
+
+    [Theory]
+    [InlineData(719)]
+    [InlineData(100)]
+    [InlineData(5000)]
+    public void An_odd_or_out_of_range_downscale_height_is_refused(int height)
+    {
+        // Odd because 4:2:0 chroma needs even dimensions — an odd height is a scale filter that
+        // fails, not a picture that is slightly the wrong size. Bounded to real display heights.
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { VideoDownscaleHeight = height }, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Contains("Downscale height", error);
+    }
+
+    [Theory]
+    [InlineData(2160)]
+    [InlineData(1080)]
+    [InlineData(720)]
+    [InlineData(480)]
+    public void A_standard_downscale_height_is_accepted(int height)
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { VideoDownscaleHeight = height }, out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(height, parsed.VideoDownscaleHeight);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(15)]
+    [InlineData(240)]
+    public void A_frame_rate_cap_outside_display_rates_is_refused(int cap)
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MaxFrameRate = cap }, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Contains("Frame-rate cap", error);
+    }
+
+    [Theory]
+    [InlineData(30)]
+    [InlineData(60)]
+    public void An_offered_frame_rate_cap_is_accepted(int cap)
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MaxFrameRate = cap }, out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(cap, parsed.MaxFrameRate);
+    }
+
+    [Fact]
+    public void An_omitted_frame_rate_cap_means_no_cap()
+    {
+        var ok = LibraryRequestParser.TryParse(Request(), out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Null(parsed.MaxFrameRate);
+    }
+
+    [Fact]
+    public void An_omitted_content_tune_means_no_tune_rather_than_an_error()
+    {
+        var ok = LibraryRequestParser.TryParse(Request(), out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(Optimisarr.Core.Queue.ContentTune.None, parsed.ContentTune);
+    }
+
+    [Fact]
+    public void An_absurdly_long_codec_exclusion_list_is_refused()
+    {
+        // The form offers a fixed set of chips, but the API takes free text and this is persisted.
+        // Bounding it keeps a malformed or hostile request from writing an unbounded column.
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { SkipSourceCodecs = string.Join(",", Enumerable.Repeat("av1", 500)) },
+            out _,
+            out var error);
+
+        Assert.False(ok);
+        Assert.Contains("codec", error, StringComparison.OrdinalIgnoreCase);
+    }
 
     [Fact]
     public void Omitted_quality_strategy_defaults_to_adaptive_vmaf_with_a_concrete_target()
@@ -167,9 +375,59 @@ public sealed class LibraryRequestParserTests
         Assert.Equal(VerificationPolicy.Default.RequireAudioRetained, parsed.RequireAudioRetained);
         Assert.Equal(VerificationPolicy.Default.RequireSubtitlesRetained, parsed.RequireSubtitlesRetained);
         Assert.Equal(VerificationPolicy.Default.RequireSizeReduction, parsed.RequireSizeReduction);
+        Assert.Null(parsed.MinimumSizeSavingPercent);
+        Assert.Null(parsed.MaximumSizeSavingPercent);
         Assert.Equal(VerificationPolicy.Default.ImageQualityGateEnabled, parsed.ImageQualityGateEnabled);
         Assert.Equal(VerificationPolicy.Default.MinimumImageSsim, parsed.MinimumImageSsim);
         Assert.Equal(VerificationPolicy.Default.ImageMetadataGateEnabled, parsed.ImageMetadataGateEnabled);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(99.1)]
+    [InlineData(double.NaN)]
+    public void Invalid_minimum_useful_saving_is_rejected(double percent)
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MinimumSizeSavingPercent = percent }, out _, out var error);
+
+        Assert.False(ok);
+        Assert.Contains("minimum useful saving", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Minimum_useful_saving_is_preserved_as_an_optional_library_policy()
+    {
+        var ok = LibraryRequestParser.TryParse(
+            Request() with { MinimumSizeSavingPercent = 10 }, out var parsed, out var error);
+
+        Assert.True(ok, error);
+        Assert.Equal(10, parsed.MinimumSizeSavingPercent);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(99.1)]
+    [InlineData(double.NaN)]
+    public void Invalid_maximum_saving_is_rejected(double percent)
+    {
+        Assert.False(LibraryRequestParser.TryParse(
+            Request() with { MaximumSizeSavingPercent = percent }, out _, out var error));
+        Assert.Contains("maximum allowed saving", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Maximum_saving_must_not_conflict_with_the_minimum_target()
+    {
+        Assert.False(LibraryRequestParser.TryParse(
+            Request() with { MinimumSizeSavingPercent = 70, MaximumSizeSavingPercent = 65 },
+            out _, out var error));
+        Assert.Contains("cannot exceed", error, StringComparison.OrdinalIgnoreCase);
+        Assert.True(LibraryRequestParser.TryParse(
+            Request() with { MinimumSizeSavingPercent = 10, MaximumSizeSavingPercent = 65 },
+            out var parsed, out error), error);
+        Assert.Equal(65, parsed.MaximumSizeSavingPercent);
     }
 
     [Theory]

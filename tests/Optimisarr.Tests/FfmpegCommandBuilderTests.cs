@@ -175,6 +175,216 @@ public sealed class FfmpegCommandBuilderTests
         Assert.True(vfIndex < IndexOf(args, "-c:v"));
     }
 
+    [Fact]
+    public void Advanced_encoder_options_reach_the_built_command()
+    {
+        // The policy decides what each family understands; this proves the resolved arguments
+        // actually land in the argument array a job runs, after the quality and effort they modify.
+        var args = FfmpegCommandBuilder.Build(Reencode() with
+        {
+            Tuning = new EncoderTuning(ContentTune.Animation, MaxBitrateKbps: 6000,
+                StrongerAdaptiveQuantisation: true)
+        });
+
+        Assert.Equal("animation", args[IndexOf(args, "-tune") + 1]);
+        Assert.Equal("6000k", args[IndexOf(args, "-maxrate") + 1]);
+        Assert.Equal("12000k", args[IndexOf(args, "-bufsize") + 1]);
+        Assert.Equal("aq-mode=3", args[IndexOf(args, "-x265-params") + 1]);
+        Assert.True(IndexOf(args, "-crf") < IndexOf(args, "-tune"));
+    }
+
+    [Fact]
+    public void A_job_with_no_advanced_options_builds_exactly_the_command_it_always_did()
+    {
+        // The guarantee that matters for everyone who never opens Advanced options.
+        Assert.Equal(
+            FfmpegCommandBuilder.Build(Reencode()),
+            FfmpegCommandBuilder.Build(Reencode() with { Tuning = EncoderTuning.None }));
+    }
+
+    [Fact]
+    public void A_downscale_emits_an_exact_scale_filter_first_in_the_video_chain()
+    {
+        // Explicit width and height, never -2: the same PictureSize feeds the verification gate,
+        // so the filter and the gate cannot disagree about rounding. First in the chain because a
+        // hardware upload has to come after any software filter, and scaling before a tone-map
+        // does the expensive colour work on fewer pixels.
+        var args = FfmpegCommandBuilder.Build(Reencode(tonemap: true) with
+        {
+            DownscaleTo = new PictureSize(1280, 720)
+        });
+
+        var chain = args[IndexOf(args, "-filter:v:0") + 1];
+        Assert.StartsWith("scale=1280:720", chain);
+        Assert.Contains("tonemap", chain);
+        Assert.True(chain.IndexOf("scale=1280:720", StringComparison.Ordinal)
+            < chain.IndexOf("tonemap", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void No_downscale_leaves_the_command_exactly_as_it_was()
+    {
+        Assert.Equal(
+            FfmpegCommandBuilder.Build(Reencode()),
+            FfmpegCommandBuilder.Build(Reencode() with { DownscaleTo = null }));
+        Assert.DoesNotContain("-filter:v:0", FfmpegCommandBuilder.Build(Reencode()));
+    }
+
+    [Fact]
+    public void A_downscale_on_a_remux_is_ignored_because_nothing_is_re_encoded()
+    {
+        // A copied stream cannot be scaled. The resolver never produces this pair, but the builder
+        // refusing it too means a remux can never silently become a re-encode.
+        var args = FfmpegCommandBuilder.Build(Reencode(videoCodec: null) with
+        {
+            DownscaleTo = new PictureSize(1280, 720)
+        });
+
+        Assert.DoesNotContain("-filter:v:0", args);
+        Assert.Equal("copy", args[IndexOf(args, "-c") + 1]);
+    }
+
+    [Fact]
+    public void A_crop_is_emitted_before_the_downscale()
+    {
+        // The downscale was computed from the cropped size, and scaling bars only to cut them
+        // away afterwards would waste the work and blur the edge.
+        var args = FfmpegCommandBuilder.Build(Reencode() with
+        {
+            CropTo = new CropRect(1920, 800, 0, 140),
+            DownscaleTo = new PictureSize(1280, 534)
+        });
+
+        var chain = args[IndexOf(args, "-filter:v:0") + 1];
+        Assert.StartsWith("crop=1920:800:0:140,scale=1280:534", chain);
+    }
+
+    [Fact]
+    public void A_crop_on_a_remux_is_ignored_because_nothing_is_re_encoded()
+    {
+        var args = FfmpegCommandBuilder.Build(Reencode(videoCodec: null) with
+        {
+            CropTo = new CropRect(1920, 800, 0, 140)
+        });
+
+        Assert.DoesNotContain("-filter:v:0", args);
+    }
+
+    [Fact]
+    public void The_expected_size_is_the_crop_unless_a_downscale_follows_it()
+    {
+        // What the verification gate will hold the output to.
+        var crop = new CropRect(1920, 800, 0, 140);
+
+        Assert.Equal(new PictureSize(1920, 800), (Reencode() with { CropTo = crop }).ExpectedSize);
+        Assert.Equal(
+            new PictureSize(1280, 534),
+            (Reencode() with { CropTo = crop, DownscaleTo = new PictureSize(1280, 534) }).ExpectedSize);
+        Assert.Null(Reencode().ExpectedSize);
+    }
+
+    [Fact]
+    public void A_frame_rate_target_emits_an_fps_filter_after_the_geometry_and_before_the_tone_map()
+    {
+        // Geometry first so the fps filter sees the final frame size; before the tone-map so the
+        // expensive colour work runs on the frames that survive rather than the ones dropped.
+        var args = FfmpegCommandBuilder.Build(Reencode(tonemap: true) with
+        {
+            DownscaleTo = new PictureSize(1280, 720),
+            FrameRate = new FrameRateDecimation(60, 30, 2)
+        });
+
+        var chain = args[IndexOf(args, "-filter:v:0") + 1];
+        Assert.Contains(@"select=not(mod(round(t*60)\,2))", chain);
+        Assert.True(chain.IndexOf("scale=", StringComparison.Ordinal) < chain.IndexOf("select=", StringComparison.Ordinal));
+        Assert.True(chain.IndexOf("select=", StringComparison.Ordinal) < chain.IndexOf("tonemap", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_frame_rate_target_takes_over_cadence_from_the_vfr_handling()
+    {
+        // -fps_mode vfr preserves a source's irregular timing. An fps filter defines a regular
+        // cadence instead; keeping both would ask the encoder to preserve timing the filter has
+        // already replaced. The filter owns cadence, so the VFR flags are not emitted.
+        var args = FfmpegCommandBuilder.Build(Reencode() with
+        {
+            SourceIsVariableFrameRate = true,
+            FrameRate = new FrameRateDecimation(60, 30, 2)
+        });
+
+        Assert.DoesNotContain("-fps_mode", args);
+        Assert.DoesNotContain("-enc_time_base:v:0", args);
+        Assert.Contains("select=", args[IndexOf(args, "-filter:v:0") + 1]);
+    }
+
+    [Fact]
+    public void Without_a_frame_rate_target_the_vfr_handling_is_unchanged()
+    {
+        var args = FfmpegCommandBuilder.Build(Reencode() with { SourceIsVariableFrameRate = true });
+
+        Assert.Equal("passthrough", args[IndexOf(args, "-fps_mode") + 1]);
+        Assert.DoesNotContain("-filter:v:0", args);
+    }
+
+    [Fact]
+    public void A_frame_rate_target_on_a_remux_is_ignored()
+    {
+        var args = FfmpegCommandBuilder.Build(
+            Reencode(videoCodec: null) with { FrameRate = new FrameRateDecimation(60, 30, 2) });
+
+        Assert.DoesNotContain("-filter:v:0", args);
+    }
+
+    // --- VideoToolbox (a macOS sidecar's hardware encoder) ----------------------------------
+
+    [Fact]
+    public void Videotoolbox_receives_its_own_quality_control_on_its_own_scale()
+    {
+        // Apple's encoders take -q:v on a 1–100 scale where higher is better, the inverse of CRF.
+        // The policy keeps the operator-facing number on the CRF scale (with hardware headroom);
+        // this is where it becomes the encoder's vocabulary. 20 on the CRF scale lands at 60.
+        var args = FfmpegCommandBuilder.Build(
+            Reencode(crf: 20, preset: null), videoEncoder: "hevc_videotoolbox");
+
+        Assert.Equal("hevc_videotoolbox", args[IndexOf(args, "-c:v:0") + 1]);
+        Assert.Equal("60", args[IndexOf(args, "-q:v") + 1]);
+        Assert.DoesNotContain("-crf", args);
+        Assert.DoesNotContain("-cq", args);
+        Assert.DoesNotContain("-global_quality", args);
+    }
+
+    [Fact]
+    public void Videotoolbox_quality_stays_inside_the_encoder_range_at_the_extremes()
+    {
+        var best = FfmpegCommandBuilder.Build(Reencode(crf: 0, preset: null), videoEncoder: "hevc_videotoolbox");
+        var worst = FfmpegCommandBuilder.Build(Reencode(crf: 51, preset: null), videoEncoder: "hevc_videotoolbox");
+
+        Assert.Equal("100", best[IndexOf(best, "-q:v") + 1]);
+        Assert.Equal("1", worst[IndexOf(worst, "-q:v") + 1]);
+    }
+
+    [Fact]
+    public void Videotoolbox_never_receives_a_preset_a_device_or_tuning_it_cannot_read()
+    {
+        var args = FfmpegCommandBuilder.Build(
+            Reencode(preset: "medium") with
+            {
+                Tuning = new EncoderTuning(ContentTune.Animation, MaxBitrateKbps: 8000, MinBitrateKbps: null, StrongerAdaptiveQuantisation: true)
+            },
+            videoEncoder: "hevc_videotoolbox",
+            hardwareDecode: true);
+
+        Assert.DoesNotContain("-preset", args);
+        Assert.DoesNotContain("-tune", args);
+        Assert.DoesNotContain("-maxrate", args);
+        Assert.DoesNotContain("-init_hw_device", args);
+        Assert.DoesNotContain("-vaapi_device", args);
+        // Its decoder is the one hardware option it does take, and only as a plain -hwaccel: no
+        // device, no pinned output format, no upload filter.
+        Assert.DoesNotContain("-hwaccel_output_format", args);
+        Assert.DoesNotContain("hwupload", string.Join(" ", args));
+    }
+
     private static TranscodeSpec Reencode(
         string? videoCodec = "hevc",
         int? crf = 23,
@@ -345,6 +555,30 @@ public sealed class FfmpegCommandBuilderTests
         // The encoder is still QSV with its constant-quality knob.
         Assert.Equal("hevc_qsv", args[IndexOf(args, "-c:v:0") + 1]);
         Assert.Equal("24", args[IndexOf(args, "-global_quality") + 1]);
+    }
+
+    [Fact]
+    public void Videotoolbox_hardware_decode_adds_hwaccel_but_leaves_frames_in_system_memory()
+    {
+        var args = FfmpegCommandBuilder.Build(
+            Reencode(crf: 24), videoEncoder: "hevc_videotoolbox", hardwareDecode: true);
+
+        // Decoded by VideoToolbox, before -i; no output format, so ffmpeg downloads the frames
+        // and every software filter still works. That is the whole reason the option is safe.
+        var hwaccelIndex = IndexOf(args, "-hwaccel");
+        Assert.Equal("videotoolbox", args[hwaccelIndex + 1]);
+        Assert.True(hwaccelIndex < IndexOf(args, "-i"));
+        Assert.DoesNotContain("-hwaccel_output_format", args);
+        Assert.Equal("hevc_videotoolbox", args[IndexOf(args, "-c:v:0") + 1]);
+    }
+
+    [Fact]
+    public void Videotoolbox_without_hardware_decode_names_no_hwaccel()
+    {
+        var args = FfmpegCommandBuilder.Build(
+            Reencode(crf: 24), videoEncoder: "hevc_videotoolbox", hardwareDecode: false);
+
+        Assert.DoesNotContain("-hwaccel", args);
     }
 
     [Fact]
@@ -698,6 +932,46 @@ public sealed class FfmpegCommandBuilderTests
         Assert.DoesNotContain("-0:t", args);
     }
 
+    [Theory]
+    [InlineData("/work/Movie.opt.mkv")]
+    [InlineData("/work/Movie.opt.mp4")]
+    public void Av1_nvenc_excludes_attached_pictures_without_dropping_the_primary_video(string outputPath)
+    {
+        var args = FfmpegCommandBuilder.Build(
+            Reencode(videoCodec: "av1") with { OutputPath = outputPath }, videoEncoder: "av1_nvenc");
+
+        Assert.Contains(("-map", "0"), MapPairs(args));
+        Assert.Contains(("-map", "-0:v:disp:attached_pic"), MapPairs(args));
+        Assert.Equal("av1_nvenc", args[IndexOf(args, "-c:v:0") + 1]);
+        Assert.True(IndexOf(args, "0") < ((List<string>)args).IndexOf("-0:v:disp:attached_pic"));
+    }
+
+    [Fact]
+    public void A_video_remux_keeps_attached_pictures_in_matroska()
+    {
+        var args = FfmpegCommandBuilder.Build(Reencode(videoCodec: null));
+
+        Assert.DoesNotContain(("-map", "-0:v:disp:attached_pic"), MapPairs(args));
+    }
+
+    [Fact]
+    public void Av1_nvenc_does_not_pass_through_timestamps_for_a_constant_frame_rate_source()
+    {
+        var args = FfmpegCommandBuilder.Build(Reencode(videoCodec: "av1"), videoEncoder: "av1_nvenc");
+
+        Assert.DoesNotContain("-fps_mode", args);
+    }
+
+    [Fact]
+    public void Av1_nvenc_preserves_a_known_variable_frame_rate_source()
+    {
+        var args = FfmpegCommandBuilder.Build(
+            Reencode(videoCodec: "av1") with { SourceIsVariableFrameRate = true }, videoEncoder: "av1_nvenc");
+
+        Assert.Equal("passthrough", args[IndexOf(args, "-fps_mode") + 1]);
+        Assert.Equal("demux", args[IndexOf(args, "-enc_time_base:v:0") + 1]);
+    }
+
     [Fact]
     public void Regenerates_timestamps_for_a_video_job_before_the_input()
     {
@@ -753,16 +1027,40 @@ public sealed class FfmpegCommandBuilderTests
         });
 
         var index = IndexOf(args, "-fps_mode");
-        Assert.Equal("vfr", args[index + 1]);
+        Assert.Equal("passthrough", args[index + 1]);
         Assert.Equal("demux", args[IndexOf(args, "-enc_time_base:v:0") + 1]);
     }
 
     [Fact]
-    public void Does_not_retime_a_cfr_or_unknown_source()
+    public void Keeps_every_frame_even_when_the_source_looks_constant()
     {
-        Assert.DoesNotContain("-fps_mode",
-            FfmpegCommandBuilder.Build(Reencode() with { OutputPath = "/work/Movie.opt.mp4" }));
-        Assert.DoesNotContain("-enc_time_base:v:0", FfmpegCommandBuilder.Build(Reencode()));
+        // This used to assert the opposite, and that is what let the bug through. FFmpeg's default
+        // frame-rate handling drops frames whose timestamps collide, and it does that on sources
+        // ffprobe is perfectly happy to call constant: a VC-1 WEBRip declaring 25/1 for both
+        // avg_frame_rate and r_frame_rate lost eight frames in its first two hundred seconds.
+        //
+        // The dangerous source is the one that looks regular and is not, so the rule cannot be
+        // conditional on having noticed.
+        var args = FfmpegCommandBuilder.Build(Reencode() with { OutputPath = "/work/Movie.opt.mp4" });
+
+        Assert.Equal("passthrough", args[IndexOf(args, "-fps_mode") + 1]);
+        // The demux timebase stays for a source known to be variable; a source that looks regular
+        // needs nothing beyond keeping its frames.
+        Assert.DoesNotContain("-enc_time_base:v:0", args);
+    }
+
+    [Fact]
+    public void Dropping_frames_is_what_made_an_encode_unmeasurable()
+    {
+        // Recorded here because the cost was not obvious. Once the candidate has fewer frames than
+        // the source, frame N of one is no longer frame N of the other, and every windowed VMAF
+        // comparison comes apart: the same pair measured 9.4 against the source and 81 against a
+        // reference cut the same lossy way. Whole seasons failed verification on quality that was
+        // never the problem, and the frames were gone from the library besides.
+        var args = FfmpegCommandBuilder.Build(Reencode());
+
+        Assert.Contains("-fps_mode", args);
+        Assert.Equal("passthrough", args[IndexOf(args, "-fps_mode") + 1]);
     }
 
     [Fact]

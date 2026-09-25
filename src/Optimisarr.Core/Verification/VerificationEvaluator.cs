@@ -11,6 +11,12 @@ namespace Optimisarr.Core.Verification;
 /// </summary>
 public static class VerificationEvaluator
 {
+    public const string SourceVideoTimelineCheckName = "Source video timeline";
+    // Half a percent covers the rounding between a planned rate (59.94 / 2) and ffprobe's rational
+    // for the same cadence (30000/1001), while staying far under the factor of two a missed
+    // decimation would show.
+    private const double FrameRateTolerance = 0.005;
+
     public static VerificationReport Evaluate(VerificationInput input, VerificationPolicy policy)
     {
         var isImage = input.Kind == MediaKind.Image;
@@ -61,6 +67,11 @@ public static class VerificationEvaluator
         }
 
         checks.Add(SizeReduced(input, policy));
+        if (isVideo && input.VideoReencoded && policy.RequireSizeReduction
+            && policy.MaximumSizeSavingPercent is > 0)
+        {
+            checks.Add(CompressionCeiling(input, policy.MaximumSizeSavingPercent.Value));
+        }
 
         // A still is verified as an image: it must contain a picture and keep its dimensions.
         // No downscaling is performed yet, so any shrink is an unintended/degenerate encode.
@@ -104,11 +115,14 @@ public static class VerificationEvaluator
             checks.Add(AudioFidelity(input));
         }
 
-        // Colour metadata is only worth comparing when the original declared some.
+        // A tone-mapped encode has an explicit Rec.709 target even if its HDR source omitted tags.
+        // Otherwise compare only when the original declared a colour domain.
         if (isVideo
-            && (input.OriginalColorPrimaries is not null
+            && (input.HdrConvertedToSdr
+                || input.OriginalColorPrimaries is not null
                 || input.OriginalColorTransfer is not null
-                || input.OriginalColorSpace is not null))
+                || input.OriginalColorSpace is not null
+                || input.OriginalColorRange is not null))
         {
             checks.Add(ColorMetadataPreserved(input));
         }
@@ -143,6 +157,7 @@ public static class VerificationEvaluator
         if (isVideo
             && input.TimestampsMeasured
             && input.OutputLastPresentationSeconds is not null
+            && !input.SourceTimelineIndeterminate
             && OriginalVideoSpanSeconds(input) is > 0)
         {
             checks.Add(TailComplete(input));
@@ -170,7 +185,20 @@ public static class VerificationEvaluator
             checks,
             Vmaf: vmafRequested
                 ? new VmafEvidence(input.QualityMeasured, input.QualityError, input.QualityScores)
-                : null);
+                : null,
+            Colour: isVideo ? ColourContract(input) : null);
+    }
+
+    private static ColourEvidence ColourContract(VerificationInput input)
+    {
+        var source = new ColourTags(input.OriginalColorPrimaries, input.OriginalColorTransfer,
+            input.OriginalColorSpace, input.OriginalColorRange);
+        var expected = input.HdrConvertedToSdr
+            ? new ColourTags("bt709", "bt709", "bt709", "tv")
+            : source;
+        var output = new ColourTags(input.OutputColorPrimaries, input.OutputColorTransfer,
+            input.OutputColorSpace, input.OutputColorRange);
+        return new ColourEvidence(source, expected, output, input.HdrConvertedToSdr);
     }
 
     private static VerificationCheck AudioMetadataPreserved(VerificationInput input)
@@ -282,6 +310,9 @@ public static class VerificationEvaluator
 
     private static VerificationCheck ColorMetadataPreserved(VerificationInput input)
     {
+        var evidence = ColourContract(input);
+        var values = $"Source {FormatColourTags(evidence.Source)}; expected {FormatColourTags(evidence.Expected)}; "
+            + $"output {FormatColourTags(evidence.Output)}.";
         if (input.HdrConvertedToSdr)
         {
             // The shared production tone-map deliberately converts BT.2020/PQ or
@@ -292,10 +323,15 @@ public static class VerificationEvaluator
             AddUnexpectedToneMapValue(unexpected, "primaries", input.OutputColorPrimaries);
             AddUnexpectedToneMapValue(unexpected, "transfer", input.OutputColorTransfer);
             AddUnexpectedToneMapValue(unexpected, "matrix", input.OutputColorSpace);
+            if (input.OutputColorRange is not null
+                && !string.Equals(input.OutputColorRange, "tv", StringComparison.OrdinalIgnoreCase))
+            {
+                unexpected.Add($"range is {input.OutputColorRange}, expected tv");
+            }
 
             return unexpected.Count == 0
-                ? Pass("Colour metadata", "Intentional HDR-to-SDR output is tagged as Rec.709.")
-                : Fail("Colour metadata", $"Tone-mapped SDR metadata is invalid: {string.Join("; ", unexpected)}.");
+                ? Pass("Colour metadata", $"Intentional HDR-to-SDR output is tagged as Rec.709. {values}")
+                : Fail("Colour metadata", $"Tone-mapped SDR metadata is invalid: {string.Join("; ", unexpected)}. {values}");
         }
 
         // Only a definite change is a failure: the original and output both declare a
@@ -303,13 +339,32 @@ public static class VerificationEvaluator
         // output is treated as benign, since absence usually means "container default".
         var mismatches = new List<string>();
         AddMismatch(mismatches, "primaries", input.OriginalColorPrimaries, input.OutputColorPrimaries);
-        AddMismatch(mismatches, "transfer", input.OriginalColorTransfer, input.OutputColorTransfer);
+        var equivalentSdTransfer = !input.OriginalIsHdr
+            && ((string.Equals(input.OriginalColorTransfer, "smpte170m", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(input.OutputColorTransfer, "bt709", StringComparison.OrdinalIgnoreCase))
+                || (string.Equals(input.OriginalColorTransfer, "bt709", StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(input.OutputColorTransfer, "smpte170m", StringComparison.OrdinalIgnoreCase)));
+        // H.262 gives SMPTE 170M and BT.709 the same transfer function. VideoToolbox can emit
+        // the BT.709 name while preserving the SD primaries and matrix; this is a tag alias,
+        // not an HDR-to-SDR conversion. All other transfer changes remain definite mismatches.
+        if (!equivalentSdTransfer)
+        {
+            AddMismatch(mismatches, "transfer", input.OriginalColorTransfer, input.OutputColorTransfer);
+        }
         AddMismatch(mismatches, "matrix", input.OriginalColorSpace, input.OutputColorSpace);
+        AddMismatch(mismatches, "range", input.OriginalColorRange, input.OutputColorRange);
 
+        var aliasDetail = equivalentSdTransfer
+            ? " SMPTE 170M and BT.709 transfer tags describe the same curve."
+            : string.Empty;
         return mismatches.Count == 0
-            ? Pass("Colour metadata", "Colour primaries, transfer, and matrix preserved.")
-            : Fail("Colour metadata", $"Colour metadata changed: {string.Join("; ", mismatches)}.");
+            ? Pass("Colour metadata", $"Colour primaries, transfer, matrix, and range preserved.{aliasDetail} {values}")
+            : Fail("Colour metadata", $"Colour metadata changed: {string.Join("; ", mismatches)}. {values}");
     }
+
+    private static string FormatColourTags(ColourTags tags) =>
+        $"primaries={tags.Primaries ?? "unknown"}, transfer={tags.Transfer ?? "unknown"}, "
+        + $"matrix={tags.Matrix ?? "unknown"}, range={tags.Range ?? "unknown"}";
 
     private static void AddUnexpectedToneMapValue(List<string> unexpected, string label, string? output)
     {
@@ -373,6 +428,21 @@ public static class VerificationEvaluator
 
     private static VerificationCheck SourceVideoTimelineComplete(VerificationInput input)
     {
+        if (input.SourceTimelineIndeterminate)
+        {
+            var sourceSpan = OriginalVideoSpanSeconds(input) ?? 0;
+            var audioSpan = Math.Max(0, input.OriginalAudioLastPresentationSeconds!.Value
+                - (input.OriginalAudioStartSeconds ?? 0));
+            var outputSpan = Math.Max(0, input.OutputLastPresentationSeconds!.Value
+                - (input.OutputVideoStartSeconds ?? 0));
+            return Fail(SourceVideoTimelineCheckName,
+                string.Format(CultureInfo.InvariantCulture,
+                    "The source packet scan spans {0:0.###}s, but primary audio spans {1:0.###}s "
+                    + "and encoded video spans {2:0.###}s. The source timeline measurement is "
+                    + "indeterminate; the original is retained until its picture timeline can be verified.",
+                    sourceSpan, audioSpan, outputSpan));
+        }
+
         const double absoluteFloorSeconds = 1.0;
         const double tolerancePercent = 2.0;
 
@@ -391,8 +461,8 @@ public static class VerificationEvaluator
             tolerancePercent);
 
         return shortfall > absoluteFloorSeconds && shortfallPercent > tolerancePercent
-            ? Fail("Source video timeline", $"{detail} The source appears corrupt or has a materially incomplete picture stream.")
-            : Pass("Source video timeline", detail);
+            ? Fail(SourceVideoTimelineCheckName, $"{detail} The source appears corrupt or has a materially incomplete picture stream.")
+            : Pass(SourceVideoTimelineCheckName, detail);
     }
 
     private static double? OriginalVideoSpanSeconds(VerificationInput input) =>
@@ -681,10 +751,44 @@ public static class VerificationEvaluator
             return Fail(name, "Source/output video dimensions could not be compared.");
         }
 
-        if (originalWidth != outputWidth || originalHeight != outputHeight)
+        // A re-encode that was told to scale is judged against what it was told, not against the
+        // source. An output at the source size when a downscale was intended is the interesting
+        // failure: the file is sound, but it is not the job that was asked for, and it must not
+        // replace the original under the belief that it is smaller. A copied stream never has an
+        // intent to honour — it cannot be scaled — so it falls through to the source-size rule.
+        if (input.VideoReencoded
+            && input.ExpectedWidth is { } expectedWidth
+            && input.ExpectedHeight is { } expectedHeight)
+        {
+            if (outputWidth != expectedWidth || outputHeight != expectedHeight)
+            {
+                return Fail(name,
+                    $"Video resolution is {outputWidth}x{outputHeight}; the encode intended {expectedWidth}x{expectedHeight} (source {originalWidth}x{originalHeight}).");
+            }
+        }
+        else if (originalWidth != outputWidth || originalHeight != outputHeight)
         {
             return Fail(name,
                 $"Video resolution changed from {originalWidth}x{originalHeight} to {outputWidth}x{outputHeight} without a resize policy.");
+        }
+
+        // Likewise a re-encode told to decimate is held to the rate it was told. An output at the
+        // source rate means the fps filter was dropped somewhere; the file is sound but it is not
+        // the job that was asked for. Probed rates carry rounding, so the comparison allows half a
+        // percent — far under the factor of two any real miss would show.
+        if (input.VideoReencoded && input.ExpectedFrameRate is { } expectedFrameRate)
+        {
+            if (input.OutputFrameRate is not { } outputFrameRate || outputFrameRate <= 0)
+            {
+                return Fail(name,
+                    $"Video frame rate could not be read; the encode intended {expectedFrameRate:0.###} fps.");
+            }
+
+            if (Math.Abs(outputFrameRate - expectedFrameRate) / expectedFrameRate > FrameRateTolerance)
+            {
+                return Fail(name,
+                    $"Video frame rate is {outputFrameRate:0.###} fps; the encode intended {expectedFrameRate:0.###} fps.");
+            }
         }
 
         var originalFormat = PixelFormatInfo.Parse(input.OriginalPixelFormat, input.OriginalBitsPerRawSample);
@@ -910,13 +1014,37 @@ public static class VerificationEvaluator
             return Pass("Size saving", $"{detail} Reduction not required by policy.");
         }
 
-        return input.OutputSizeBytes < input.OriginalSizeBytes
+        var minimum = input.Kind == MediaKind.Video && input.VideoReencoded
+            ? policy.MinimumSizeSavingPercent
+            : null;
+        var maximumBytes = SizeBudget.MaxCandidateBytes(
+            input.OriginalSizeBytes, requireReduction: true, disposable: false,
+            minimumSavingPercent: minimum);
+        if (maximumBytes is null)
+        {
+            return Fail("Size saving", $"{detail} Original size is unavailable.");
+        }
+
+        return input.OutputSizeBytes <= maximumBytes.Value
             ? Pass("Size saving", detail)
-            : Fail("Size saving", $"{detail} Output is not smaller than the original.");
+            : Fail("Size saving", minimum is > 0
+                ? $"{detail} At least {minimum:0.##}% saving is required for this video re-encode."
+                : $"{detail} Output is not smaller than the original.");
     }
 
     private static double PercentChange(long original, long output) =>
         original > 0 ? (output - original) / (double)original * 100.0 : 0;
+
+    private static VerificationCheck CompressionCeiling(VerificationInput input, double maximumSavingPercent)
+    {
+        var minimumBytes = SizeBudget.MinCandidateBytes(
+            input.OriginalSizeBytes, requireReduction: true, disposable: false,
+            maximumSavingPercent: maximumSavingPercent);
+        return minimumBytes is { } minimum && input.OutputSizeBytes >= minimum
+            ? Pass("Compression ceiling", $"Output remains within the {maximumSavingPercent:0.##}% maximum saving.")
+            : Fail("Compression ceiling",
+                $"Output is smaller than the {maximumSavingPercent:0.##}% maximum saving allows.");
+    }
 
     private static string Describe(string? error) =>
         string.IsNullOrWhiteSpace(error) ? "no detail available" : error;
